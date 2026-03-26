@@ -62,6 +62,7 @@ RUN cd /work/rbus && \
 # usp-pa-vendor-rdk
 COPY usp-pa-vendor-rdk /work/usp-pa-vendor-rdk
 RUN cd /work/usp-pa-vendor-rdk/src/vendor && \
+    (make distclean 2>/dev/null || true) && \
     autoreconf --force --install && \
     mkdir -p build && \
     cd build && \
@@ -75,7 +76,7 @@ RUN cd /work/usp-pa-vendor-rdk/src/vendor && \
 # Create symlink for UspPA as requested by user
 RUN ln -s /usr/local/bin/obuspa /usr/local/bin/UspPA
 
-COPY start_services.sh /usr/local/bin/start_services.sh
+COPY usp-pa-vendor-rdk/de_dm_notify/start_services.sh /usr/local/bin/start_services.sh
 RUN chmod +x /usr/local/bin/start_services.sh
 
 # Ensure log files exist for tail
@@ -83,5 +84,9 @@ RUN touch /var/log/rtrouted.log /var/log/obuspa.log
 
 # Ensure etc directory exists for vendor config
 RUN mkdir -p /etc/usp-pa && chmod 777 /etc/usp-pa
+
+# Ensure libraries are found
+ENV LD_LIBRARY_PATH=/usr/local/lib
+RUN ldconfig
 
 ENTRYPOINT [ "/usr/local/bin/start_services.sh" ]
