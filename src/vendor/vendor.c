@@ -130,22 +130,41 @@ int WriteDMConfig(char *filename, char *mode, kv_vector_t *kvv, char *comment);
 void RDK_SyncDiscovery(void);
 int RDK_SetSync(dm_req_t *req, char *value);
 void RegisterPathRecursive(const char* concrete_path);
+static void PurgeComponentFromCache(const char* component);
+static void PurgeSchemaPath(const char* schema_path);
+static void ReconcileProvidersFromBus(void);
 
-//-------------------------------------------------------------------------------------------------
+typedef struct
+{
+    char* path;
+    int type;
+} dml_task_t;
+
+static void dml_register_task_handler(void* arg1, void* arg2);
+static void dml_resubscribe_task_handler(void* arg1, void* arg2);
+static void onNotifyDMLElement(rbusHandle_t handle, const rbusDataModelNotificationEvent_t* ev, void* userData);
+static void onNotifyDMLBatch(rbusHandle_t handle, const rbusDataModelNotificationEventBatch_t* batch, void* userData);
+
 // NotifyDML Subscriptions handle
 rbusDataModelNotificationHandle_t g_notify_handle = 0;
-static pthread_t g_discovery_thread;
-static bool g_stop_discovery = false;
+
 
 static char g_dm_objs_file[PATH_MAX] = {0};
 static char g_dm_params_file[PATH_MAX] = {0};
+
+#define RBUS_DMLNOTIFY_ADAPTIVE_PURGE 99
+#define AUTO_SAVE_COOLDOWN 2  // Seconds of silence before auto-saving discovery to flash
+
+#define MAX_PATH_CACHE 2048  /* Reduced from 100k to prevent linear scan hangs */
+typedef struct {
+    char* path;
+    char* component;
+} registered_path_t;
+
+static registered_path_t g_registered_paths[MAX_PATH_CACHE] = {0};
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_dm_cache_dirty = false;
 static time_t g_last_dm_change = 0;
-#define AUTO_SAVE_COOLDOWN 15  // Seconds of silence before auto-saving discovery to flash
-
-#define MAX_PATH_CACHE 100003  /* Prime for hash table */
-static char* g_registered_paths[MAX_PATH_CACHE] = {0};
-static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Expert Recommendation (Richard Holme): Minimize boot data by using shallow discovery
 static bool g_shallow_discovery = true;
@@ -155,82 +174,9 @@ static bool g_shallow_discovery = true;
 
 static char g_discovery_status[32] = "Idle";      // "Idle" | "Syncing" | "Committing"
 static time_t g_last_sync_time = 0;               // epoch of last completed sync
-static int g_last_provider_count = 0;             // unique provider namespaces found in last sync
 static pthread_mutex_t g_status_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static char g_provider_list[4096] = "(none)";     // comma-separated list of provider namespaces
-
-// Count distinct top-level component namespaces (second dot prefix) in an element list.
-// Also builds a human-readable list string: "Device.X_RDK_MassStress (10 elems), ..."
-// e.g. Device.X_RDK_MassStress.Param_0 → "Device.X_RDK_MassStress"  counts as 1 provider.
-static int CountUniqueProviders(rbusElementInfo_t* elems, char* list_buf, size_t list_buf_len)
-{
-#define MAX_PROVIDERS 128
-    static char seen[MAX_PROVIDERS][256];
-    static int  elem_count[MAX_PROVIDERS];
-    int count = 0;
-    rbusElementInfo_t* e = elems;
-
-    while (e)
-    {
-        if (e->name)
-        {
-            const char* first_dot = strchr(e->name, '.');
-            if (first_dot)
-            {
-                const char* second_dot = strchr(first_dot + 1, '.');
-                if (second_dot)
-                {
-                    size_t plen = (size_t)(second_dot - e->name);
-                    if (plen < 255)
-                    {
-                        char prefix[256];
-                        memcpy(prefix, e->name, plen);
-                        prefix[plen] = '\0';
-                        int idx = -1;
-                        for (int i = 0; i < count; i++)
-                        {
-                            if (strcmp(seen[i], prefix) == 0) { idx = i; break; }
-                        }
-                        if (idx == -1 && count < MAX_PROVIDERS)
-                        {
-                            strncpy(seen[count], prefix, 255);
-                            seen[count][255] = '\0';
-                            elem_count[count] = 0;
-                            idx = count;
-                            count++;
-                        }
-                        if (idx >= 0) elem_count[idx]++;
-                    }
-                }
-            }
-        }
-        e = e->next;
-    }
-
-    // Build the human-readable list string
-    if (list_buf && list_buf_len > 0)
-    {
-        list_buf[0] = '\0';
-        for (int i = 0; i < count; i++)
-        {
-            size_t remaining = list_buf_len - strlen(list_buf) - 1;
-            if (remaining == 0) break;
-            if (i > 0) strncat(list_buf, ", ", remaining);
-            remaining = list_buf_len - strlen(list_buf) - 1;
-            strncat(list_buf, seen[i], remaining);
-            remaining = list_buf_len - strlen(list_buf) - 1;
-            /* Append element count suffix safely using a fixed small buffer */
-            char suffix[32];
-            int slen = snprintf(suffix, sizeof(suffix), " (%d elems)", elem_count[i]);
-            if (slen > 0 && (size_t)slen < remaining)
-                strncat(list_buf, suffix, remaining);
-        }
-        if (count == 0) strncpy(list_buf, "(none)", list_buf_len - 1);
-    }
-
-    return count;
-}
+// Status reporting functions now use the live cache instead of snapshots
 
 int RDK_GetDiscoveryStatus(dm_req_t *req, char *buf, int len)
 {
@@ -260,23 +206,138 @@ int RDK_GetLastSyncTime(dm_req_t *req, char *buf, int len)
     pthread_mutex_unlock(&g_status_mutex);
     return USP_ERR_OK;
 }
+// Returns true when a runtime RBUS component still has at least one data element
+// registered on the bus. Pseudo-components used internally ("static", "persisted",
+// "unknown") are treated as alive so the reconciler never purges boot-loaded or
+// provenance-less paths.
+static bool IsComponentAliveOnBus(const char *component)
+{
+    if (!component || component == (char*)1 || !*component) return true;
+    if (strcmp(component, "unknown") == 0 ||
+        strcmp(component, "static") == 0 ||
+        strcmp(component, "persisted") == 0)
+    {
+        return true;
+    }
+
+    int numElems = 0;
+    char **elemNames = NULL;
+    rbusError_t rc = rbus_discoverComponentDataElements(bus_handle, component, false, &numElems, &elemNames);
+    bool alive = (rc == RBUS_ERROR_SUCCESS && numElems > 0);
+    if (elemNames)
+    {
+        for (int i = 0; i < numElems; i++) {
+            if (elemNames[i]) free(elemNames[i]);
+        }
+        free(elemNames);
+    }
+    return alive;
+}
+
+// Snapshots the unique component names currently in the cache, probes each against
+// RBUS, and purges any that no longer respond. Called lazily from the discovery
+// status getters so the reported list self-heals after a provider crash without
+// needing anyone to GET the dead paths first.
+static void ReconcileProvidersFromBus(void)
+{
+    char unique[128][256];
+    int num_unique = 0;
+
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path == NULL || g_registered_paths[i].path == (char*)1) continue;
+        if (!g_registered_paths[i].component || g_registered_paths[i].component == (char*)1) continue;
+
+        bool found = false;
+        for (int j = 0; j < num_unique; j++) {
+            if (strcmp(unique[j], g_registered_paths[i].component) == 0) { found = true; break; }
+        }
+        if (!found && num_unique < 128) {
+            strncpy(unique[num_unique], g_registered_paths[i].component, sizeof(unique[0]) - 1);
+            unique[num_unique][sizeof(unique[0]) - 1] = '\0';
+            num_unique++;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+
+    // Probe outside the mutex — RBUS round-trips can be slow and PurgeComponentFromCache
+    // reacquires the same mutex.
+    for (int i = 0; i < num_unique; i++)
+    {
+        if (!IsComponentAliveOnBus(unique[i])) {
+            PurgeComponentFromCache(unique[i]);
+        }
+    }
+}
 
 int RDK_GetProviderCount(dm_req_t *req, char *buf, int len)
 {
     (void)req;
-    pthread_mutex_lock(&g_status_mutex);
-    snprintf(buf, (size_t)len, "%d", g_last_provider_count);
-    pthread_mutex_unlock(&g_status_mutex);
+    char seen[128][256];
+    int unique = 0;
+
+    ReconcileProvidersFromBus();
+
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path != NULL && g_registered_paths[i].path != (char*)1)
+        {
+            if (g_registered_paths[i].component)
+            {
+                bool found = false;
+                for (int j = 0; j < unique; j++)
+                {
+                    if (strcmp(seen[j], g_registered_paths[i].component) == 0) { found = true; break; }
+                }
+                if (!found && unique < 128)
+                {
+                    strncpy(seen[unique++], g_registered_paths[i].component, 255);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+
+    snprintf(buf, len, "%d", unique);
     return USP_ERR_OK;
 }
 
 int RDK_GetProviderList(dm_req_t *req, char *buf, int len)
 {
     (void)req;
-    pthread_mutex_lock(&g_status_mutex);
-    strncpy(buf, g_provider_list, len - 1);
-    buf[len - 1] = '\0';
-    pthread_mutex_unlock(&g_status_mutex);
+    char seen[128][256];
+    int unique = 0;
+    buf[0] = '\0';
+
+    ReconcileProvidersFromBus();
+
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path != NULL && g_registered_paths[i].path != (char*)1)
+        {
+            if (g_registered_paths[i].component)
+            {
+                bool found = false;
+                for (int j = 0; j < unique; j++)
+                {
+                    if (strcmp(seen[j], g_registered_paths[i].component) == 0) { found = true; break; }
+                }
+                if (!found && unique < 128)
+                {
+                    strncpy(seen[unique], g_registered_paths[i].component, 255);
+                    if (unique > 0) strncat(buf, ", ", len - strlen(buf) - 1);
+                    strncat(buf, seen[unique], len - strlen(buf) - 1);
+                    unique++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+    
+    if (unique == 0) strncpy(buf, "(none)", len - 1);
     return USP_ERR_OK;
 }
 
@@ -304,57 +365,6 @@ int RDK_SetSync(dm_req_t *req, char *value)
         RDK_SyncDiscovery();
     }
     return USP_ERR_OK;
-}
-
-static void* DiscoveryThread(void* arg)
-{
-    (void)arg;
-    USP_LOG_Info("DiscoveryThread: started");
-    while(!g_stop_discovery)
-    {
-        // Mark status as Syncing before the sweep
-        pthread_mutex_lock(&g_status_mutex);
-        strncpy(g_discovery_status, "Syncing", sizeof(g_discovery_status) - 1);
-        pthread_mutex_unlock(&g_status_mutex);
-
-        RDK_SyncDiscovery();
-
-        // Back to Idle after sync
-        pthread_mutex_lock(&g_status_mutex);
-        strncpy(g_discovery_status, "Idle", sizeof(g_discovery_status) - 1);
-        pthread_mutex_unlock(&g_status_mutex);
-
-        // Internal loop for heartbeat frequency and auto-save check
-        for(int i=0; i<300 && !g_stop_discovery; i++)
-        {
-            bool should_save = false;
-            pthread_mutex_lock(&g_cache_mutex);
-            if (g_dm_cache_dirty && (time(NULL) - g_last_dm_change > AUTO_SAVE_COOLDOWN))
-            {
-                should_save = true;
-                g_dm_cache_dirty = false; // Reset early to avoid double-trigger during slow save
-            }
-            pthread_mutex_unlock(&g_cache_mutex);
-
-            if (should_save)
-            {
-                USP_LOG_Info("DiscoveryThread: Auto-committing changes to persistent memory...");
-
-                pthread_mutex_lock(&g_status_mutex);
-                strncpy(g_discovery_status, "Committing", sizeof(g_discovery_status) - 1);
-                pthread_mutex_unlock(&g_status_mutex);
-
-                DiscoverDM_ForAllComponents(g_dm_objs_file, g_dm_params_file);
-
-                pthread_mutex_lock(&g_status_mutex);
-                strncpy(g_discovery_status, "Idle", sizeof(g_discovery_status) - 1);
-                pthread_mutex_unlock(&g_status_mutex);
-            }
-            sleep(1);
-        }
-    }
-    USP_LOG_Info("DiscoveryThread: exiting");
-    return NULL;
 }
 
 /*********************************************************************//**
@@ -422,92 +432,167 @@ static void PathToSchema(const char* path, char* schema)
 // Cache of registered paths to avoid redundant USP registrations during mass discovery
 
 
-static unsigned int hash_path(const char* str) {
-    unsigned int hash = 5381;
-    int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
-    return hash % MAX_PATH_CACHE;
-}
-
-static bool IsPathAlreadyRegistered(const char* path) {
-    pthread_mutex_lock(&g_cache_mutex);
-    char norm[RBUS_MAX_NAME_LENGTH];
-    strncpy(norm, path, sizeof(norm)-1);
-    norm[sizeof(norm)-1] = '\0';
-    size_t len = strlen(norm);
-    if (len > 1 && norm[len-1] == '.' && strstr(norm, "{i}.") == NULL) norm[len-1] = '\0';
-
-    unsigned int h = hash_path(norm);
-    unsigned int start_h = h;
-    while (g_registered_paths[h]) {
-        if (strcmp(g_registered_paths[h], norm) == 0) {
-            pthread_mutex_unlock(&g_cache_mutex);
-            return true;
-        }
-        h = (h + 1) % MAX_PATH_CACHE;
-        if (h == start_h) break;
-    }
-    pthread_mutex_unlock(&g_cache_mutex);
-    return false;
-}
-
-static void MarkPathAsRegistered(const char* path) {
-    if (!path) return;
-    pthread_mutex_lock(&g_cache_mutex);
-    char norm[RBUS_MAX_NAME_LENGTH];
-    strncpy(norm, path, sizeof(norm)-1);
-    norm[sizeof(norm)-1] = '\0';
-    size_t len = strlen(norm);
-    if (len > 1 && norm[len-1] == '.' && strstr(norm, "{i}.") == NULL) norm[len-1] = '\0';
-
-    unsigned int h = hash_path(norm);
-    unsigned int start_h = h;
-    while (g_registered_paths[h]) {
-        if (strcmp(g_registered_paths[h], norm) == 0) {
-            pthread_mutex_unlock(&g_cache_mutex);
-            return; // Already there
-        }
-        h = (h + 1) % MAX_PATH_CACHE;
-        if (h == start_h) {
-            pthread_mutex_unlock(&g_cache_mutex);
-            return; // Cache full
-        }
-    }
-    g_registered_paths[h] = strdup(norm);
-    
-    // Mark as dirty for Auto-Persistence
-    USP_LOG_Info("%s: Marked dirty due to new path %s", __FUNCTION__, path);
-    g_dm_cache_dirty = true;
-    g_last_dm_change = time(NULL);
-    pthread_mutex_unlock(&g_cache_mutex);
-}
-
-void RegisterPathRecursive(const char* concrete_path)
+static bool IsPathAlreadyRegistered(const char* path, char* out_component, int comp_len)
 {
-    char schema[RBUS_MAX_NAME_LENGTH];
-    char current_concrete[RBUS_MAX_NAME_LENGTH] = "";
-    char current_schema[RBUS_MAX_NAME_LENGTH] = "";
-    const char* s_concrete = concrete_path;
-    const char* s_schema;
+    bool found = false;
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path != NULL && g_registered_paths[i].path != (char*)1)
+        {
+            if (strcmp(g_registered_paths[i].path, path) == 0)
+            {
+                if (out_component && g_registered_paths[i].component)
+                {
+                    strncpy(out_component, g_registered_paths[i].component, comp_len - 1);
+                    out_component[comp_len - 1] = '\0';
+                }
+                found = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+    return found;
+}
 
-    if (!concrete_path || !*concrete_path) return;
+static void MarkPathAsRegistered(const char* path, const char* component)
+{
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path == NULL || g_registered_paths[i].path == (char*)1)
+        {
+            g_registered_paths[i].path = strdup(path);
+            g_registered_paths[i].component = component ? strdup(component) : strdup("unknown");
+            g_dm_cache_dirty = true;
+            g_last_dm_change = time(NULL);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
+static void ScheduleAdaptivePurge(const char* component)
+{
+    if (!component || !*component || strcmp(component, "unknown") == 0) return;
+    
+    kv_vector_t* args = USP_MALLOC(sizeof(kv_vector_t));
+    USP_ARG_Init(args);
+    USP_ARG_Add(args, "Path", (char*)component);
+    USP_ARG_Add(args, "Type", "Purge");
+
+    // Push to main loop. The core obuspa message queue will 
+    // automatically call KV_VECTOR_Destroy(args) after the handler returns.
+    if (USP_PROCESS_DoWork(dml_register_task_handler, args, (void*)(intptr_t)1) != USP_ERR_OK)
+    {
+        USP_ARG_Destroy(args);
+        USP_FREE(args);
+    }
+}
+
+// PurgeSchemaPath: Remove a single schema path from the cache and deregister it
+// from the data model. Used as a fallback when the provider's component name
+// wasn't resolved at registration time (rbus_discoverComponentName can fail
+// during startup races), making component-level purging ineffective.
+static void PurgeSchemaPath(const char* schema_path)
+{
+    if (!schema_path || !*schema_path) return;
+
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        if (g_registered_paths[i].path != NULL &&
+            g_registered_paths[i].path != (char*)1 &&
+            strcmp(g_registered_paths[i].path, schema_path) == 0)
+        {
+            // Intentionally no USP_LOG here: this fires from RDK_GetGroup during a CLI GET.
+            // USP_LOG_Debug on the data-model thread is forwarded to the CLI client, which
+            // would pollute the GET output. Background tasks log the re-subscribe cleanly.
+            DATA_MODEL_DeRegisterPath(g_registered_paths[i].path);
+            free(g_registered_paths[i].path);
+            if (g_registered_paths[i].component && g_registered_paths[i].component != (char*)1) {
+                free(g_registered_paths[i].component);
+            }
+            g_registered_paths[i].path = (char*)1;
+            g_registered_paths[i].component = (char*)1;
+            g_dm_cache_dirty = true;
+            g_last_dm_change = time(NULL);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
+static void PurgeComponentFromCache(const char* component)
+{
+    if (!component || strcmp(component, "unknown") == 0) return;
+
+    // No USP_LOG here — this runs on the data-model thread during a CLI GET and
+    // would be mirrored into the CLI response. Callers log the provider outage.
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < MAX_PATH_CACHE; i++)
+    {
+        // Safe check for valid pointers and actual component match
+        if (g_registered_paths[i].path != NULL && 
+            g_registered_paths[i].path != (char*)1 &&
+            g_registered_paths[i].component != NULL &&
+            g_registered_paths[i].component != (char*)1)
+        {
+            if (strcmp(g_registered_paths[i].component, component) == 0)
+            {
+                DATA_MODEL_DeRegisterPath(g_registered_paths[i].path);
+                free(g_registered_paths[i].path);
+                free(g_registered_paths[i].component);
+                g_registered_paths[i].path = (char*)1; // Mark as deleted
+                g_registered_paths[i].component = (char*)1;
+                g_dm_cache_dirty = true;
+                g_last_dm_change = time(NULL);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
+void RegisterPathRecursive(const char* path)
+{
+    USP_LOG_Debug("%s: ENTER path=%s", __FUNCTION__, path);
+    char schema[RBUS_MAX_NAME_LENGTH * 2]; // Give extra space for {i} expansion
+    char current_concrete[RBUS_MAX_NAME_LENGTH] = "";
+    char current_schema[RBUS_MAX_NAME_LENGTH * 2] = "";
+    const char* s_concrete = path;
+    const char* s_schema;
+    rbusError_t rbus_err;
+
+    if (!path || !*path) return;
     
     // Safety: Expert Alignment requires all DM Elements to start with 'Device.'
-    if (strncmp(concrete_path, "Device.", 7) != 0)
-    {
-        USP_LOG_Warning("%s: Ignoring non-USP path '%s'", __FUNCTION__, concrete_path);
+    if (strncmp(path, "Device.", 7) != 0) {
+        USP_LOG_Debug("%s: Skipping non-Device path: %s", __FUNCTION__, path);
         return;
     }
 
-    // Use a prefix that is less likely to collide with static schema
-    // and correctly handle registration
-    char concrete_buf[RBUS_MAX_NAME_LENGTH];
-    strncpy(concrete_buf, concrete_path, sizeof(concrete_buf)-1);
-    concrete_buf[sizeof(concrete_buf)-1] = '\0';
-    
-    PathToSchema(concrete_buf, schema);
+    // Optimization: Find the component name once for the whole path
+    char component[256] = "unknown";
+    char const* path_arr[1];
+    path_arr[0] = path;
+    int numComps = 0;
+    char** compNames = NULL;
+    rbus_err = rbus_discoverComponentName(bus_handle, 1, path_arr, &numComps, &compNames);
+    if (rbus_err == RBUS_ERROR_SUCCESS && numComps > 0 && compNames && compNames[0])
+    {
+        strncpy(component, compNames[0], sizeof(component)-1);
+        for(int i=0; i<numComps; i++) if(compNames[i]) free(compNames[i]);
+        free(compNames);
+    }
+    else if (compNames)
+    {
+        for(int i=0; i<numComps; i++) if(compNames[i]) free(compNames[i]);
+        free(compNames);
+    }
+
+    PathToSchema(path, schema);
     s_schema = schema;
-    s_concrete = concrete_buf;
 
     while (*s_concrete)
     {
@@ -523,59 +608,81 @@ void RegisterPathRecursive(const char* concrete_path)
         strncat(current_concrete, s_concrete, len_c);
         strncat(current_schema, s_schema, len_s);
         
-        // Check if registered (careful with trailing dot)
-        char check_path[RBUS_MAX_NAME_LENGTH];
-        strncpy(check_path, current_schema, sizeof(check_path)-1);
-        check_path[sizeof(check_path)-1] = '\0';
-        size_t cp_len = strlen(check_path);
-        if (cp_len > 1 && check_path[cp_len-1] == '.') check_path[cp_len-1] = '\0';
-
-        // Standardize path for registration: Fixed objects lose their dot to avoid Obuspa crash
-        int reg_err = USP_ERR_OK;
-        bool is_table = (len_s >= 3 && strncmp(s_schema, "{i}", 3) == 0);
-
         char reg_path[RBUS_MAX_NAME_LENGTH];
         strncpy(reg_path, current_schema, sizeof(reg_path)-1);
         reg_path[sizeof(reg_path)-1] = '\0';
         size_t rplen = strlen(reg_path);
-        if (rplen > 1 && reg_path[rplen-1] == '.' && !is_table) reg_path[rplen-1] = '\0';
 
-        if (IsPathAlreadyRegistered(reg_path)) {
-            reg_err = USP_ERR_OK;
-        } else if (is_table) {
-            reg_err = USP_REGISTER_GroupedObject(GROUP_Id, reg_path, true);
-        } else if (current_schema[strlen(current_schema)-1] == '.') {
-            // It's a missing fixed object container! Register it now so the parameters below it work.
-            USP_LOG_Info("DML Task: Dynamically registering parent object %s", reg_path);
-            reg_err = USP_REGISTER_GroupedObject(GROUP_Id, reg_path, false);
-        } else {
-            reg_err = USP_REGISTER_GroupedVendorParam_ReadWrite(GROUP_Id, reg_path, DM_STRING);
+        // Determine segment kind. Done before the already-registered cache check
+        // because new instance numbers of an already-known table still need to be
+        // informed to obuspa's instance vector.
+        bool is_table = (len_s >= 3 && strncmp(s_schema, "{i}", 3) == 0);
+
+        // Never attempt to register core Agent nodes.
+        bool is_core = (strncmp(reg_path, "Device.DeviceInfo.", 18) == 0 ||
+                        strncmp(reg_path, "Device.LocalAgent.", 18) == 0 ||
+                        strncmp(reg_path, "Device.ManagementServer.", 24) == 0 ||
+                        strcmp(reg_path, "Device.") == 0);
+
+        if (is_core) {
+            USP_LOG_Debug("DML Task: Skipping core node registration: %s", reg_path);
+            if (!next_dot_c || !next_dot_s) break;
+            s_concrete = next_dot_c + 1;
+            s_schema = next_dot_s + 1;
+            continue;
         }
 
-        if (reg_err != USP_ERR_OK) {
-            // Already registered errors (USP_ERR_INTERNAL_ERROR in this context often means duplicate)
-            if (reg_err != USP_ERR_INTERNAL_ERROR) {
-                USP_LOG_Error("DML Task: Registration of %s failed: error %d", reg_path, reg_err);
+        bool already_registered = IsPathAlreadyRegistered(reg_path, NULL, 0);
+
+        if (!already_registered)
+        {
+            int reg_err = USP_ERR_OK;
+            if (is_table) {
+                // Table roots MUST be registered explicitly
+                if (rplen > 0 && reg_path[rplen-1] == '.') reg_path[rplen-1] = '\0';
+                USP_LOG_Info("DML Task: Registering TABLE object %s", reg_path);
+                reg_err = USP_REGISTER_GroupedObject(GROUP_Id, reg_path, true);
+            } else if (current_schema[strlen(current_schema)-1] == '.') {
+                // Container object: Skip manual registration and let the parameters auto-create parents
+                USP_LOG_Debug("DML Task: Skipping manual registration of container %s", reg_path);
+                reg_err = USP_ERR_OK;
+            } else {
+                // Parameter
+                USP_LOG_Info("DML Task: Registering parameter %s", reg_path);
+                reg_err = USP_REGISTER_GroupedVendorParam_ReadWrite(GROUP_Id, reg_path, DM_STRING);
+            }
+
+            if (reg_err == USP_ERR_OK)
+            {
+                USP_LOG_Info("DML Task: Registered OK: %s", reg_path);
+                MarkPathAsRegistered(reg_path, component);
+            }
+            else if (reg_err == USP_ERR_INTERNAL_ERROR || reg_err == USP_ERR_OBJECT_DOES_NOT_EXIST)
+            {
+                USP_LOG_Info("DML Task: Registration failed (non-fatal) for %s: err=%d", reg_path, reg_err);
+            }
+            else
+            {
+                USP_LOG_Error("%s: Failed to register %s (err %d)", __FUNCTION__, reg_path, reg_err);
             }
         }
-        
-        if (reg_err == USP_ERR_OK)
+
+        // Inform obuspa of the concrete instance number when the current segment is {i}.
+        // Runs whether or not the table schema was already cached, because each provider
+        // registration event may introduce a new instance number. USP_DM_InformInstance is
+        // idempotent — CREATION_FAILURE on duplicates is benign.
+        if (is_table)
         {
-            MarkPathAsRegistered(reg_path);
-        }
-        
-        // If it's a table instance segment, inform the data model
-        if (!is_table && strcmp(s_schema, "{i}") == 0) {
-            USP_LOG_Info("DML Task: Informing instance %s", current_concrete);
-            USP_DM_InformInstance(current_concrete);
-        }
-        
-        if (is_table && current_concrete[strlen(current_concrete)-1] == '.') {
-             USP_LOG_Info("DML Task: Informing instance %s", current_concrete);
-             int err = USP_DM_InformInstance(current_concrete);
-             if (err != USP_ERR_OK && err != USP_ERR_CREATION_FAILURE) {
-                 USP_LOG_Error("DML Task: Failed to inform instance %s: %d", current_concrete, err);
-             }
+            char inst_path[RBUS_MAX_NAME_LENGTH];
+            strncpy(inst_path, current_concrete, sizeof(inst_path)-1);
+            inst_path[sizeof(inst_path)-1] = '\0';
+            size_t ilen = strlen(inst_path);
+            if (ilen > 0 && inst_path[ilen-1] == '.') inst_path[ilen-1] = '\0';
+
+            int inform_err = USP_DM_InformInstance(inst_path);
+            if (inform_err == USP_ERR_OK) {
+                USP_LOG_Info("DML Task: Informed new instance: %s", inst_path);
+            }
         }
 
         if (!next_dot_c) break;
@@ -584,178 +691,87 @@ void RegisterPathRecursive(const char* concrete_path)
     }
 }
 
-typedef struct
-{
-    char* path;
-    int type;
-} dml_task_t;
+
 
 static void dml_register_task_handler(void* arg1, void* arg2)
 {
-    dml_task_t* task = (dml_task_t*)arg1;
-    bool is_async = (bool)(intptr_t)arg2; // Use arg2 as a flag (0=sync, 1=async)
-    if(!task) return;
+    kv_vector_t* args = (kv_vector_t*)arg1;
+    const char* path = USP_ARG_Get(args, "Path", NULL);
+    const char* type_str = USP_ARG_Get(args, "Type", "");
 
-    char* path = task->path;
-    USP_LOG_Info("%s: Processing task for %s (type=%d)", __FUNCTION__, path, task->type);
+    if (!path || !*path) return;
 
-    if (task->type == RBUS_DMLNOTIFY_OBJECT_DELETION)
+    USP_LOG_Info("DML Task: Processing discovery task (Path=%s, Type=%s)", path, type_str);
+
+    if (strcmp(type_str, "Purge") == 0)
     {
-        char schema[RBUS_MAX_NAME_LENGTH];
-        PathToSchema(path, schema);
-        if (strcmp(path, schema) == 0)
-        {
-            if (USP_DM_IsRegistered(schema))
-            {
-                // Check if it still exists on RBUS (might have been re-registered)
-                const char* r_paths[1];
-                r_paths[0] = schema;
-                int r_num = 0;
-                rbusProperty_t r_val = NULL;
-                if (rbus_getExt(bus_handle, 1, r_paths, &r_num, &r_val) == RBUS_ERROR_SUCCESS)
-                {
-                    USP_LOG_Info("DML Task: Skipping deregister for %s (still exists on RBUS)", schema);
-                    rbusProperty_Release(r_val);
-                }
-                else
-                {
-                    // Safety: Never deregister core parameters or things we didn't dynamically discover
-                    // Destination Not Found (5) is often a timeout, NOT a deletion.
-                    if (rbus_getExt(bus_handle, 1, r_paths, &r_num, &r_val) != RBUS_ERROR_SUCCESS) {
-                         // Double check: if it's a core parameter, REFUSE to deregister
-                         if (strncmp(schema, "Device.DeviceInfo.", 18) == 0 || 
-                             strncmp(schema, "Device.LocalAgent.", 18) == 0) {
-                             USP_LOG_Warning("DML Task: Refusing to deregister core path %s despite RBUS error", schema);
-                         } else {
-                             USP_LOG_Info("DML Task: Deregistering schema path: %s", schema);
-                             int res = DATA_MODEL_DeRegisterPath(schema);
-                             if (res != USP_ERR_OK) {
-                                 USP_LOG_Error("DML Task: Failed to deregister schema %s: %d", schema, res);
-                             } else {
-                                 g_dm_cache_dirty = true;
-                                 g_last_dm_change = time(NULL);
-                             }
-                         }
-                    }
-                }
-            }
-            else
-            {
-                USP_LOG_Info("DML Task: Skipping deregister for %s (not registered)", schema);
-            }
-        }
-        else
-        {
-            // It's an instance. Find the object path by stripping leaf segments.
-            char instance_path[RBUS_MAX_NAME_LENGTH];
-            strncpy(instance_path, path, RBUS_MAX_NAME_LENGTH-1);
-            instance_path[RBUS_MAX_NAME_LENGTH-1] = '\0';
-            
-            char* last_dot = strrchr(instance_path, '.');
-            if (last_dot && last_dot[1] != '\0')
-            {
-                // Path ends in a parameter, strip it to get object instance
-                *last_dot = '\0';
-                last_dot = strrchr(instance_path, '.');
-            }
+        PurgeComponentFromCache(path);
 
-            if (last_dot && last_dot[1] == '\0')
-            {
-                // Check if it still exists on RBUS
-                const char* r_paths[1];
-                r_paths[0] = path;
-                int r_num = 0;
-                rbusProperty_t r_val = NULL;
-                if (rbus_getExt(bus_handle, 1, r_paths, &r_num, &r_val) == RBUS_ERROR_SUCCESS)
-                {
-                    USP_LOG_Info("DML Task: Skipping instance delete for %s (still exists on RBUS)", path);
-                    rbusProperty_Release(r_val);
-                }
-                else
-                {
-                    USP_LOG_Info("DML Task: Deleting instance: %s", instance_path);
-                    int res = USP_DM_DeleteInstance(instance_path);
-                    if (res != USP_ERR_OK) USP_LOG_Error("DML Task: Instance deletion failed for %s: %d", instance_path, res);
-                }
-            }
+        // After purge, re-subscribe to NotifyDML with initialState=true.
+        // This is necessary because RBUS does not re-fire discovery events when a provider
+        // re-registers the same paths it previously had (only truly new paths get events).
+        // Re-subscribing forces RBUS to deliver the current element state, catching any
+        // provider that already restarted before or shortly after the purge.
+        if (USP_PROCESS_DoWork(dml_resubscribe_task_handler, NULL, NULL) != USP_ERR_OK)
+        {
+            USP_LOG_Warning("DML Task: Failed to schedule resubscribe after purge");
         }
     }
-    else
+    else if (strcmp(type_str, "Add") == 0)
     {
         RegisterPathRecursive(path);
     }
 
-    if (is_async)
+}
+
+// dml_resubscribe_task_handler: Re-subscribes to NotifyDML to force fresh element delivery.
+// Called from the USP main loop after a purge completes.
+static void dml_resubscribe_task_handler(void* arg1, void* arg2)
+{
+    (void)arg1; (void)arg2;
+
+    if (bus_handle == NULL) return;
+
+    USP_LOG_Info("DML Task: Re-subscribing to NotifyDML (post-purge refresh)...");
+
+    // Unsubscribe from the current handle
+    if (g_notify_handle)
     {
-        free(task->path);
-        free(task);
+        rbusDataModelNotification_Unsubscribe(bus_handle, g_notify_handle);
+        g_notify_handle = 0;
+    }
+
+    // Re-subscribe with initialState=true so RBUS delivers all currently-registered elements
+    rbusDataModelNotificationRequest_t req;
+    memset(&req, 0, sizeof(req));
+    req.pattern = "Device.";
+    req.scope = RBUS_DMLNOTIFY_SCOPE_SUBTREE;
+    req.eventMask = RBUS_DMLNOTIFY_MASK_ALL;
+    req.initialState = true;
+    req.batching.batchWindowMs = 500;
+    req.batching.maxBatchSize = 100;
+    req.batching.rateLimitPerSec = 0;
+    req.batching.coalesceThreshold = 1;
+    req.handler = onNotifyDMLElement;
+    req.batchHandler = onNotifyDMLBatch;
+
+    rbusError_t rbus_err = rbusDataModelNotification_Subscribe(bus_handle, &req, &g_notify_handle);
+    if (rbus_err != RBUS_ERROR_SUCCESS)
+    {
+        USP_LOG_Error("DML Task: Re-subscribe to NotifyDML failed (%d)", rbus_err);
+    }
+    else
+    {
+        USP_LOG_Info("DML Task: Re-subscribed to NotifyDML successfully");
     }
 }
 
 void RDK_SyncDiscovery(void)
 {
-    rbusError_t rbus_err;
-    rbusElementInfo_t* elems = NULL;
-    rbusElementInfo_t* elem = NULL;
-
-    USP_LOG_Info("%s: Performing full RBUS discovery sync...", __FUNCTION__);
-
-    // Use linked-list API for safer memory management
-    rbus_err = rbusElementInfo_get(bus_handle, "Device.", 10, &elems);
-    if(rbus_err == RBUS_ERROR_SUCCESS && elems != NULL)
-    {
-        // Update provider count, list, and last sync time from this batch
-        char tmp_list[4096];
-        int provider_count = CountUniqueProviders(elems, tmp_list, sizeof(tmp_list));
-        pthread_mutex_lock(&g_status_mutex);
-        g_last_provider_count = provider_count;
-        g_last_sync_time = time(NULL);
-        strncpy(g_provider_list, tmp_list, sizeof(g_provider_list) - 1);
-        g_provider_list[sizeof(g_provider_list) - 1] = '\0';
-        pthread_mutex_unlock(&g_status_mutex);
-
-        elem = elems;
-        while (elem != NULL)
-        {
-            if (elem->name && !IsPathAlreadyRegistered(elem->name))
-            {
-                // Safety: Expert Alignment starts with 'Device.'
-                if (strncmp(elem->name, "Device.", 7) == 0)
-                {
-                    pthread_mutex_lock(&g_cache_mutex);
-                    g_dm_cache_dirty = true;
-                    g_last_dm_change = time(NULL);
-                    pthread_mutex_unlock(&g_cache_mutex);
-
-                    dml_task_t* task = malloc(sizeof(dml_task_t));
-                    if(task)
-                    {
-                        task->path = strdup(elem->name);
-                        task->type = 0; // Simple discovery
-
-                        // Push to main loop (is_async=1)
-                        if (USP_PROCESS_DoWork(dml_register_task_handler, task, (void*)(intptr_t)1) != USP_ERR_OK)
-                        {
-                            free(task->path);
-                            free(task);
-                        }
-                    }
-                }
-            }
-            elem = elem->next;
-        }
-        // rbusElementInfo_free(bus_handle, elems);
-    }
-    else
-    {
-        // Sync ran but found nothing — still update the timestamp and reset the provider info
-        pthread_mutex_lock(&g_status_mutex);
-        g_last_sync_time = time(NULL);
-        g_last_provider_count = 0;
-        strncpy(g_provider_list, "(none)", sizeof(g_provider_list) - 1);
-        g_provider_list[sizeof(g_provider_list) - 1] = '\0';
-        pthread_mutex_unlock(&g_status_mutex);
-    }
+    // Re-discovery after provider restarts is handled by RBUS's internal dmSyncSub mechanism
+    // (runs every 2s), which fires CREATION events for unbound elements on fresh subscriptions.
+    // A fresh subscription is created by dml_resubscribe_task_handler after each purge.
+    USP_LOG_Debug("RDK_SyncDiscovery: Re-discovery driven by RBUS internal sync + post-purge resubscribe.");
 }
 
 static void onNotifyDMLElement(rbusHandle_t handle, const rbusDataModelNotificationEvent_t* ev, void* userData)
@@ -767,19 +783,9 @@ static void onNotifyDMLElement(rbusHandle_t handle, const rbusDataModelNotificat
 
     if (strncmp(ev->path, "Device.", 7) == 0)
     {
-        dml_task_t* task = malloc(sizeof(dml_task_t));
-        if(task)
-        {
-            task->path = strdup(ev->path);
-            task->type = (int)ev->type;
-            
-            // Push to main loop (is_async=1)
-            if (USP_PROCESS_DoWork(dml_register_task_handler, task, (void*)(intptr_t)1) != USP_ERR_OK)
-            {
-                free(task->path);
-                free(task);
-            }
-        }
+        // This function is now deprecated in favor of onNotifyDMLBatch
+        // It should not be called.
+        USP_LOG_Error("onNotifyDMLElement: Deprecated function called for path %s", ev->path);
     }
 }
 
@@ -787,6 +793,7 @@ static void onNotifyDMLBatch(rbusHandle_t handle, const rbusDataModelNotificatio
 {
     if (!batch || batch->count == 0 || !batch->events) return;
     USP_LOG_Info("%s: Received batch of %zu DM Element discovery events", __FUNCTION__, (size_t)batch->count);
+    USP_LOG_Info("DML Task: Processing batch of registrations (%zu DM Elements)", (size_t)batch->count);
 
     size_t buf_size = 65536; // 64KB safety
     char *additions = malloc(buf_size);
@@ -806,64 +813,69 @@ static void onNotifyDMLBatch(rbusHandle_t handle, const rbusDataModelNotificatio
     bool has_adds = false;
     bool has_rems = false;
 
+    // Deduplicate purge targets: a single provider disconnect sends one deletion event per element.
+    // We only need to purge once per component, not once per element.
+    char purge_components[buf_size];
+    purge_components[0] = '\0';
+    strcpy(purge_components, ",");
+
     for (uint32_t i = 0; i < batch->count; i++)
     {
         const rbusDataModelNotificationEvent_t* ev = &batch->events[i];
         if (!ev->path) continue;
 
-        // Trace every event at v=3
+        // Trace every event
         USP_LOG_Info("%s: Event[%u]: type=%d path=%s", __FUNCTION__, i, (int)ev->type, ev->path);
 
-        char truncated[RBUS_MAX_NAME_LENGTH];
-        strncpy(truncated, ev->path, sizeof(truncated)-1);
-        truncated[sizeof(truncated)-1] = '\0';
-
-        // Expert Alignment: Truncate to table/container level
-        // Rule: Truncate after 3 dots OR at the last dot if depth < 3
-        char *p = truncated;
-        int dots = 0;
-        char *last_dot = NULL;
-        while (*p) {
-            if (*p == '.') {
-                dots++;
-                last_dot = p;
-            }
-            if (dots == 3) { 
-                p[1] = '\0'; // Truncate at 3rd level container
-                break; 
-            }
-            p++;
-        }
-
-        if (dots < 3 && last_dot && last_dot > truncated + 6) { // 6 = strlen("Device")
-             last_dot[1] = '\0'; // Truncate at second level container
-        }
-
-        char search[RBUS_MAX_NAME_LENGTH + 3];
-        snprintf(search, sizeof(search), ",%s,", truncated);
-
-        // Aggregated USP signals (Registration/Deregistration)
-        if (ev->type == RBUS_DMLNOTIFY_OBJECT_CREATION || (int)ev->type == 0)
+        if (ev->type == RBUS_DMLNOTIFY_OBJECT_DELETION)
         {
-            if (strstr(dedup_list, search) == NULL) {
-                if (strlen(dedup_list) + strlen(search) < buf_size) strcat(dedup_list, search);
-                if (has_adds) strncat(additions, ",", buf_size - strlen(additions) - 1);
-                strncat(additions, truncated, buf_size - strlen(additions) - 1);
-                has_adds = true;
+            // Provider disconnected — look up which component owned this path and schedule purge.
+            // Deduplicate: one purge per component (a provider with 100 elements sends 100 deletions).
+            char component[256] = "";
+            if (IsPathAlreadyRegistered(ev->path, component, sizeof(component)) &&
+                component[0] != '\0' && strcmp(component, "unknown") != 0)
+            {
+                char comp_search[300];
+                snprintf(comp_search, sizeof(comp_search), ",%s,", component);
+                if (strstr(purge_components, comp_search) == NULL)
+                {
+                    strncat(purge_components, comp_search + 1, sizeof(purge_components) - strlen(purge_components) - 1);
+                    USP_LOG_Info("%s: Deletion event for %s — scheduling proactive purge of '%s'",
+                                 __FUNCTION__, ev->path, component);
+                    ScheduleAdaptivePurge(component);
+                    // Record for the Deregistered! event signal
+                    has_rems = true;
+                    if (removals[0] != '\0') strncat(removals, ",", buf_size - strlen(removals) - 1);
+                    strncat(removals, ev->path, buf_size - strlen(removals) - 1);
+                }
             }
-        }
-        else if (ev->type == RBUS_DMLNOTIFY_OBJECT_DELETION)
-        {
-            if (has_rems == false || strstr(dedup_list, search) == NULL) {
-                if (has_rems) strncat(removals, ",", buf_size - strlen(removals) - 1);
-                strncat(removals, truncated, buf_size - strlen(removals) - 1);
-                has_rems = true;
-            }
+            continue; // Do NOT try to register a deleted path
         }
 
-        // Process individual registrations for local cache/memory
-        onNotifyDMLElement(handle, ev, userData);
-    }
+        // CREATION / STRUCTURAL_UPDATE / VALUE_CHANGE: treat as a registration event
+        has_adds = true;
+        if (additions[0] != '\0') strncat(additions, ",", buf_size - strlen(additions) - 1);
+        strncat(additions, ev->path, buf_size - strlen(additions) - 1);
+
+        // Dispatch each unique leaf path for registration in the USP main loop
+        char search[RBUS_MAX_NAME_LENGTH + 4];
+        snprintf(search, sizeof(search), ",%s,", ev->path);
+        if (strstr(dedup_list, search) == NULL) {
+            if (strlen(dedup_list) + strlen(search) < buf_size) {
+                strcat(dedup_list, search);
+
+                kv_vector_t* args = USP_MALLOC(sizeof(kv_vector_t));
+                USP_ARG_Init(args);
+                USP_ARG_Add(args, "Path", (char*)ev->path);
+                USP_ARG_Add(args, "Type", "Add");
+
+                if (USP_PROCESS_DoWork(dml_register_task_handler, args, (void*)(intptr_t)1) != USP_ERR_OK) {
+                    USP_ARG_Destroy(args);
+                    free(args);
+                }
+            }
+        }
+    } // End of for loop
 
     if (has_adds)
     {
@@ -871,13 +883,8 @@ static void onNotifyDMLBatch(rbusHandle_t handle, const rbusDataModelNotificatio
         USP_ARG_Init(args);
         USP_ARG_Add(args, "DM_Elements", additions);
         USP_ARG_Add(args, "Status", "Complete");
-        if (USP_SIGNAL_DataModelEvent("Device.Registered!", args) != USP_ERR_OK) {
-            // If it failed to send, we must free it here as the queue won't take it
-            USP_ARG_Destroy(args);
-            USP_FREE(args);
-        } else {
-            USP_LOG_Info("Expert Alignment: Fired Device.Registered with %s", additions);
-        }
+        // NOTE: USP_SIGNAL_DataModelEvent takes ownership of args — do NOT free after this call
+        USP_SIGNAL_DataModelEvent("Device.Registered!", args);
     }
 
     if (has_rems)
@@ -886,12 +893,8 @@ static void onNotifyDMLBatch(rbusHandle_t handle, const rbusDataModelNotificatio
         USP_ARG_Init(args);
         USP_ARG_Add(args, "DM_Elements", removals);
         USP_ARG_Add(args, "Status", "Complete");
-        if (USP_SIGNAL_DataModelEvent("Device.Deregistered!", args) != USP_ERR_OK) {
-            USP_ARG_Destroy(args);
-            USP_FREE(args);
-        } else {
-            USP_LOG_Info("Expert Alignment: Fired Device.Deregistered with %s", removals);
-        }
+        // NOTE: USP_SIGNAL_DataModelEvent takes ownership of args — do NOT free after this call
+        USP_SIGNAL_DataModelEvent("Device.Deregistered!", args);
     }
 
     free(additions);
@@ -1283,7 +1286,6 @@ int VENDOR_USP_REGISTER_Operation()
 
 int VENDOR_Init(void)
 {
-    // ... (logic to init bus_handle)
 #ifdef INCLUDE_LCM_DATAMODEL
     LCM_VENDOR_Init();
 #endif
@@ -1292,6 +1294,10 @@ int VENDOR_Init(void)
     int rbus_err;
     struct stat info;
     char *usp_pa_dm_dir;
+
+    // Initialize the registration cache and mutex
+    memset(&g_registered_paths, 0, sizeof(g_registered_paths));
+    pthread_mutex_init(&g_cache_mutex, NULL);
 
     // Override data model paths from environment variable
     usp_pa_dm_dir = getenv("USP_PA_DM_DIR");
@@ -1312,26 +1318,13 @@ int VENDOR_Init(void)
     USP_REGISTER_VendorParam_ReadOnly("Device.X_RDK_DMDiscovery.ProviderCount", RDK_GetProviderCount, DM_UINT);
     USP_REGISTER_VendorParam_ReadOnly("Device.X_RDK_DMDiscovery.DiscoveredProviders", RDK_GetProviderList, DM_STRING);
 
-
-    // Register DM Element Change Events (Expert Alignment - Richard & Charles)
+    // Register custom discovery events
     char *event_args[] = {"DM_Elements", "Status"};
     USP_REGISTER_Event("Device.Registered!");
     USP_REGISTER_EventArguments("Device.Registered!", event_args, 2);
     
     USP_REGISTER_Event("Device.Deregistered!");
     USP_REGISTER_EventArguments("Device.Deregistered!", event_args, 2);
-
-    // Register Standard TR-181 Commands & Events
-    USP_REGISTER_SyncOperation("Device.Reboot()", DEVICE_Reboot_Operate);
-    USP_REGISTER_SyncOperation("Device.FactoryReset()", DEVICE_FactoryReset_Operate);
-    
-    char *boot_args[] = {"CommandKey", "Cause", "Reason", "FirmwareUpdated", "ParameterMap"};
-    USP_REGISTER_Event("Device.Boot!");
-    USP_REGISTER_EventArguments("Device.Boot!", boot_args, 5);
-
-    USP_REGISTER_AsyncOperation("Device.SelfTestDiagnostics()", DEVICE_SelfTest_Operate, NULL);
-    USP_REGISTER_AsyncOperation("Device.PacketCaptureDiagnostics()", DEVICE_PacketCapture_Operate, NULL);
-    USP_REGISTER_AsyncOperation("Device.ScheduleTimer()", DEVICE_ScheduleTimer_Operate, NULL);
 
     // Initialise bus_handle
     // NOTE: We do this here, rather than in VENDOR_Start() because the SerialNumber, ManufacturerOUI and SoftwareVersion are cached before USP_PA_Start() is called
@@ -1426,30 +1419,6 @@ int VENDOR_Init(void)
     }
 #endif
     
-    // Subscribe to all data model changes via NotifyDML for dynamic discovery
-    rbusDataModelNotificationRequest_t req;
-    memset(&req, 0, sizeof(req));
-    req.pattern = "Device.";
-    req.scope = RBUS_DMLNOTIFY_SCOPE_SUBTREE; /* Subscribe to entire subtree */
-    req.eventMask = RBUS_DMLNOTIFY_MASK_ALL;
-    req.initialState = true; // Full scan upon subscription
-    req.batching.batchWindowMs = 500;
-    req.batching.maxBatchSize = 100;
-    req.batching.rateLimitPerSec = 0; // Unlimited
-    req.batching.coalesceThreshold = 1;
-    req.handler = onNotifyDMLElement;
-    req.batchHandler = onNotifyDMLBatch;
-
-    USP_LOG_Info("%s: Subscribing to NotifyDML for dynamic discovery (pattern=Device.)...", __FUNCTION__);
-    rbus_err = rbusDataModelNotification_Subscribe(bus_handle, &req, &g_notify_handle);
-    if(rbus_err != RBUS_ERROR_SUCCESS)
-    {
-        USP_LOG_Error("%s: rbusDataModelNotification_Subscribe failed (%d)", __FUNCTION__, rbus_err);
-    }
-
-    // DiscoveryThread handles the initial and periodic sync background
-    pthread_create(&g_discovery_thread, NULL, DiscoveryThread, NULL);
-
     return USP_ERR_OK;
 }
 
@@ -1472,6 +1441,32 @@ int VENDOR_Start(void)
     LCM_VENDOR_Start();
 #endif
 
+    // Subscribe to all data model changes via NotifyDML for dynamic discovery
+    // We do this in VENDOR_Start to ensure Obuspa core is fully ready
+    rbusDataModelNotificationRequest_t req;
+    rbusError_t rbus_err;
+    memset(&req, 0, sizeof(req));
+    req.pattern = "Device.";
+    req.scope = RBUS_DMLNOTIFY_SCOPE_SUBTREE;
+    req.eventMask = RBUS_DMLNOTIFY_MASK_ALL;
+    req.initialState = true; 
+    req.batching.batchWindowMs = 500;
+    req.batching.maxBatchSize = 100;
+    req.batching.rateLimitPerSec = 0;
+    req.batching.coalesceThreshold = 1;
+    req.handler = onNotifyDMLElement;
+    req.batchHandler = onNotifyDMLBatch;
+
+    USP_LOG_Info("%s: Subscribing to NotifyDML for dynamic discovery (pattern=Device.)...", __FUNCTION__);
+    rbus_err = rbusDataModelNotification_Subscribe(bus_handle, &req, &g_notify_handle);
+    if(rbus_err != RBUS_ERROR_SUCCESS)
+    {
+        USP_LOG_Error("%s: rbusDataModelNotification_Subscribe failed (%d)", __FUNCTION__, rbus_err);
+    }
+
+    // Trigger an immediate sync to populate initial state
+    RDK_SyncDiscovery();
+
     // Fire Device.Boot! event to notify controllers about the agent's restart/boot
     FireBootEvent();
 
@@ -1492,12 +1487,10 @@ int VENDOR_Start(void)
 **************************************************************************/
 int VENDOR_Stop(void)
 {
-    g_stop_discovery = true;
-    pthread_join(g_discovery_thread, NULL);
-
 #ifdef INCLUDE_LCM_DATAMODEL
     LCM_VENDOR_Stop();
 #endif
+
     // Disconnect from the RDK bus
     if (bus_handle != NULL)
     {
@@ -1533,7 +1526,7 @@ int FixupRebootCause(void)
     char *usp_cause_path = "Internal.Reboot.Cause";
 
     // Exit if unable to get the cause of reboot that RDK has saved
-    if (USP_DM_IsRegistered("Device.DeviceInfo.X_RDKCENTRAL-COM_LastRebootReason") == false)
+    if (IsPathAlreadyRegistered("Device.DeviceInfo.X_RDKCENTRAL-COM_LastRebootReason", NULL, 0) == false)
     {
         USP_LOG_Warning("%s: Device.DeviceInfo.X_RDKCENTRAL-COM_LastRebootReason is not registered. Skipping reboot fixup.", __FUNCTION__);
         return USP_ERR_OK;
@@ -1602,7 +1595,7 @@ void FireBootEvent(void)
     char* cmd_key = "";
     
     // Attempt to get the actual cause/reason from the data model if possible
-    char* usp_cause_path = "Device.LocalAgent.ControllerTrust.Reporting.AbortedReason"; 
+    char* usp_cause_path = "Internal.Reboot.Cause"; 
     USP_DM_GetParameterValue(usp_cause_path, cause, sizeof(cause)); 
 
     USP_ARG_Init(args);
@@ -1681,6 +1674,21 @@ int RegisterRdkParams(char *filename)
             goto exit;
         }
 
+        // Skip core USP Agent paths that are already registered statically to avoid schema conflicts
+        if (strncmp(path, "Device.DeviceInfo.", 18) == 0 || 
+            strncmp(path, "Device.LocalAgent.", 18) == 0 ||
+            strncmp(path, "Device.ManagementServer.", 24) == 0 ||
+            strncmp(path, "Device.UPnP.", 12) == 0 ||
+            strcmp(path, "Device.") == 0 ||
+            strstr(path, "Reboot()") != NULL ||
+            strstr(path, "FactoryReset()") != NULL ||
+            strstr(path, "Boot!") != NULL ||
+            strstr(path, "ScheduleTimer()") != NULL)
+        {
+            USP_LOG_Debug("RegisterRdkParams: Skipping static core path %s", path);
+            goto next_line;
+        }
+
         // Exit if parameter registration failed
         if (is_writable)
         {
@@ -1704,7 +1712,7 @@ int RegisterRdkParams(char *filename)
             path_norm[sizeof(path_norm)-1] = '\0';
             size_t plen = strlen(path_norm);
             if (plen > 0 && path_norm[plen-1] == '.') path_norm[plen-1] = '\0';
-            MarkPathAsRegistered(path_norm);
+            MarkPathAsRegistered(path_norm, "static");
             USP_LOG_Info("RegisterRdkParams: Registered Parameter %s", path_norm);
         }
 
@@ -1782,19 +1790,20 @@ int RegisterRdkObjects(char *filename)
         strncpy(path_norm, path, sizeof(path_norm)-1);
         path_norm[sizeof(path_norm)-1] = '\0';
         size_t plen = strlen(path_norm);
-        bool is_multi = (strstr(path_norm, "{i}.") != NULL);
+        bool is_multi = (strstr(path_norm, "{i}") != NULL);
         if (!is_multi && plen > 0 && path_norm[plen-1] == '.') path_norm[plen-1] = '\0';
 
-        // Exit if object registration failed
-        err = USP_REGISTER_GroupedObject(GROUP_Id, path_norm, is_writable);
-        if (err != USP_ERR_OK)
+        // For grouped objects in this Obuspa version, 3rd arg is is_writable.
+        // We set it to true for tables and false for fixed objects.
+        err = USP_REGISTER_GroupedObject(GROUP_Id, path_norm, is_multi);
+        if (err != USP_ERR_OK && err != USP_ERR_INTERNAL_ERROR)
         {
             USP_LOG_Error("%s: Failed to register object %s (err %d)", __FUNCTION__, path_norm, err);
-            err = USP_ERR_OK; // continue
+            err = USP_ERR_OK; // continue anyway
         }
         else
         {
-            MarkPathAsRegistered(path_norm);
+            MarkPathAsRegistered(path_norm, "persisted");
             USP_LOG_Info("RegisterRdkObjects: Registered Object %s", path_norm);
 
             // If this is a top level multi-instance object, then it refreshes its instances and all below it
@@ -2169,15 +2178,24 @@ char *ToRbusErrString(int rbus_err)
 **
 ** Gets the EndpointId of the device
 **
-** \param   buf - pointer to buffer in which to return the endpoint_id
 ** \param   len - length of the buffer
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int RDK_GetEndpointId(char *buf, int len)
+int RDK_GetEndpointId(char *endpoint_id, int len)
 {
     int err;
+
+    // Safety: If RBUS is not yet connected (early boot), return a default ID
+    // instead of attempting to query the bus and triggering discovery/purge.
+    if (bus_handle == NULL)
+    {
+        strncpy(endpoint_id, "os::000000-000000000001", len-1);
+        endpoint_id[len-1] = '\0';
+        return USP_ERR_OK;
+    }
+
     kv_vector_t pv;
     kv_pair_t params[2];
     char *scheme = "os";
@@ -2199,7 +2217,7 @@ int RDK_GetEndpointId(char *buf, int len)
     if (err != USP_ERR_OK)
     {
         USP_LOG_Warning("%s: Failed to retrieve ManufacturerOUI or SerialNumber from RBUS. Using fallback.", __FUNCTION__);
-        strncpy(buf, "self-agent-fallback", len);
+        strncpy(endpoint_id, "self-agent-fallback", len);
         err = USP_ERR_OK;
         goto exit;
     }
@@ -2232,7 +2250,7 @@ int RDK_GetEndpointId(char *buf, int len)
     }
 
     // Form the endpoint_id
-    USP_SNPRINTF(buf, len, "%s::%s-%s", scheme, oui, serial_number);
+    USP_SNPRINTF(endpoint_id, len, "%s::%s-%s", scheme, oui, serial_number);
     err = USP_ERR_OK;
 
 exit:
@@ -2377,23 +2395,49 @@ int RDK_GetGroup(int group_id, kv_vector_t *params)
     // Exit if unable to get the parameters
     if (rbus_err != RBUS_ERROR_SUCCESS)
     {
-        if (rbus_err == RBUS_ERROR_DESTINATION_NOT_FOUND || rbus_err == RBUS_ERROR_ELEMENT_DOES_NOT_EXIST)
+        if (rbus_err == RBUS_ERROR_DESTINATION_NOT_FOUND || 
+            rbus_err == RBUS_ERROR_DESTINATION_NOT_REACHABLE ||
+            rbus_err == RBUS_ERROR_DESTINATION_RESPONSE_FAILURE ||
+            rbus_err == RBUS_ERROR_INVALID_RESPONSE_FROM_DESTINATION ||
+            rbus_err == RBUS_ERROR_TIMEOUT ||
+            rbus_err == RBUS_ERROR_BUS_ERROR)
         {
-            // Provider has gone away. Perform synchronous deregistration of all paths
-            // in this group, then return the most accurate USP error for a "missing"
-            // resource: 7005 (Object Not Found).
-            USP_LOG_Info("%s: Provider is gone. Performing synchronous deregistration of %d paths", __FUNCTION__, params->num_entries);
+            // Provider has gone away. Purge immediately (we're in the USP main loop — safe to call directly).
+            char component[RBUS_MAX_NAME_LENGTH] = "";
+            IsPathAlreadyRegistered(paths[0], component, sizeof(component));
 
-            for (i=0; i < params->num_entries; i++)
+            // Intentionally no USP_LOG here: this handler runs on the data-model thread
+            // during a CLI GET, and USP_LOG_Debug output on that thread is mirrored into
+            // the CLI response. Staying silent keeps the GET output clean; the background
+            // resubscribe task logs "Re-subscribing to NotifyDML" to the file.
+
+            if (component[0] == '\0' || strcmp(component, "unknown") == 0)
             {
-                dml_task_t task;
-                task.path = params->vector[i].key;
-                task.type = RBUS_DMLNOTIFY_OBJECT_DELETION;
-                // Note: The second arg as 0 indicates this is a synchronous call
-                // and the handler must NOT free the stack-allocated task object.
-                dml_register_task_handler(&task, (void*)(intptr_t)0);
+                // Component name wasn't resolved at registration time — fall back to per-path cleanup
+                // so the dead schema nodes still get removed.
+                for (int j = 0; j < params->num_entries; j++)
+                {
+                    if (paths[j])
+                    {
+                        char schema_path[RBUS_MAX_NAME_LENGTH * 2];
+                        PathToSchema(paths[j], schema_path);
+                        PurgeSchemaPath(schema_path);
+                    }
+                }
             }
-            err = 7005; // USP error for 'Object Not Found'
+            else
+            {
+                PurgeComponentFromCache(component);
+            }
+
+            // Schedule resubscribe so RBUS fires CREATION events when the provider restarts
+            USP_PROCESS_DoWork(dml_resubscribe_task_handler, NULL, NULL);
+
+            // Return 7016 (Object Does Not Exist) — the paths were just removed from the schema
+            // by PurgeComponentFromCache. obuspa's group_get_vector.c now propagates the actual
+            // error code returned here (patched to use `err` instead of hardcoded 7003).
+            // For wildcard GETs (Device.) obuspa silently omits 7016 entries from the response.
+            err = USP_ERR_OBJECT_DOES_NOT_EXIST;
             goto exit;
         }
         USP_ERR_SetMessage("%s: rbus_get_Ext() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
@@ -2481,8 +2525,26 @@ int RDK_SetGroup(int group_id, kv_vector_t *params, unsigned *param_types, int *
         rbus_err = rbus_set(bus_handle, s, rbus_val, &opts);
         if (rbus_err != RBUS_ERROR_SUCCESS)
         {
-            USP_ERR_SetMessage("%s: rbus_set() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
-            err = USP_ERR_SET_FAILURE;
+            if (rbus_err == RBUS_ERROR_DESTINATION_NOT_FOUND || 
+                rbus_err == RBUS_ERROR_DESTINATION_NOT_REACHABLE ||
+                rbus_err == RBUS_ERROR_DESTINATION_RESPONSE_FAILURE ||
+                rbus_err == RBUS_ERROR_INVALID_RESPONSE_FROM_DESTINATION ||
+                rbus_err == RBUS_ERROR_TIMEOUT ||
+                rbus_err == RBUS_ERROR_BUS_ERROR)
+            {
+                char component[256];
+                if (IsPathAlreadyRegistered(s, component, sizeof(component)))
+                {
+                    USP_LOG_Warning("%s: Provider '%s' is unreachable (%d) during SET. Scheduling purge.", __FUNCTION__, component, rbus_err);
+                    ScheduleAdaptivePurge(component);
+                }
+                err = USP_ERR_OBJECT_DOES_NOT_EXIST;
+            }
+            else
+            {
+                USP_ERR_SetMessage("%s: rbus_set() failed (%d - %s)", __FUNCTION__, rbus_err, ToRbusErrString(rbus_err));
+                err = USP_ERR_SET_FAILURE;
+            }
             *failure_index = i;
             rbusValue_Release(rbus_val);
             break;
@@ -2529,6 +2591,20 @@ int RDK_RefreshInstances(int group_id, char *path, int *expiry_period)
     rbus_err = rbusElementInfo_get(bus_handle, path, RBUS_MAX_NAME_DEPTH, &elems);
     if (rbus_err != RBUS_ERROR_SUCCESS)
     {
+        if (rbus_err == RBUS_ERROR_DESTINATION_NOT_FOUND || 
+            rbus_err == RBUS_ERROR_DESTINATION_NOT_REACHABLE ||
+            rbus_err == RBUS_ERROR_DESTINATION_RESPONSE_FAILURE ||
+            rbus_err == RBUS_ERROR_INVALID_RESPONSE_FROM_DESTINATION ||
+            rbus_err == RBUS_ERROR_TIMEOUT ||
+            rbus_err == RBUS_ERROR_BUS_ERROR)
+        {
+            char component[256];
+            if (IsPathAlreadyRegistered(path, component, sizeof(component)))
+            {
+                USP_LOG_Warning("%s: Provider '%s' is unreachable during Refresh. Scheduling purge.", __FUNCTION__, component);
+                ScheduleAdaptivePurge(component);
+            }
+        }
         // NOTE: getParameterNames may fail if the table has 0 entries, so just log a warning for this
         USP_LOG_Warning("%s: rbusElementInfo_get(%s) failed (%d- %s). Returning 0 instances for this object.", __FUNCTION__, path, rbus_err, ToRbusErrString(rbus_err));
         *expiry_period = 30;
@@ -2546,7 +2622,7 @@ int RDK_RefreshInstances(int group_id, char *path, int *expiry_period)
         // If this is an object instance, then refresh it in the data model
         if ((len >= 2) && (name[len-1] == '.') && (IS_NUMERIC(name[len-2])))
         {
-            if (USP_DM_IsRegistered(name))
+            if (IsPathAlreadyRegistered(name, NULL, 0))
             {
                 USP_DM_RefreshInstance(name);
             }

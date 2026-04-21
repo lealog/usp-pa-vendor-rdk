@@ -78,7 +78,7 @@ sequenceDiagram
 This is a background mechanism used to reconcile the data model. Even if all signals from Path A are missed, this path ensures the data model eventually reaches a consistent state.
 
 #### **How it works on Boot**
-1.  **Thread Launch**: Within `VENDOR_Init` ([vendor.c:L1451](file:///Users/oscar.leal2/IdeaProjects/obusp_rbus/usp-pa-vendor-rdk/src/vendor/vendor.c#L1451)), the Agent spawns a dedicated `DiscoveryThread`.
+1.  **Thread Launch**: Within `VENDOR_Init` (see `vendor.c`, function `VENDOR_Init`), the Agent spawns a dedicated `DiscoveryThread`.
 2.  **Immediate Sweep**: The thread immediately executes a full data model sweep (`RDK_SyncDiscovery`). 
 3.  **Boot Race Resolution**: This is critical for catching components that started and registered their elements *before* the USP Agent was fully initialized and listening for signals.
 
@@ -113,8 +113,7 @@ Used for real-time updates when a component adds a small number of elements (e.g
 *   **Mechanism**: Based on the `rbus.notify.discovery` signal.
 *   **Code Reference**: `vendor.c::onNotifyDMLElement`
 ```c
-// vendor.c:1440
-req.handler = onNotifyDMLElement; 
+req.handler = onNotifyDMLElement;
 // Inside onNotifyDMLElement:
 task->path = strdup(ev->path);
 task->type = (int)ev->type;
@@ -126,7 +125,6 @@ Used when a component (e.g., Security Firewall) registers hundreds of rules at o
 *   **Mechanism**: The NotifyDML Manager aggregates individual signals based on `batchWindowMs`.
 *   **Code Reference**: `vendor.c::onNotifyDMLBatch`
 ```c
-// vendor.c:1441
 req.batchHandler = onNotifyDMLBatch;
 // Inside onNotifyDMLBatch:
 for (i = 0; i < batch->count; i++) {
@@ -140,13 +138,34 @@ for (i = 0; i < batch->count; i++) {
 
 ## 4. Unregistration Handling (Crashes & Deletions)
 
-The system handles both single unregistrations and massive "component gone" events.
+The system handles both single unregistrations and massive "component gone" events, and reports back to callers using standard USP TR-369 error codes.
 
 1.  **Single Unregister**: Handled via `RBUS_DMLNOTIFY_OBJECT_DELETION` signal in the batch handler.
-2.  **Batch/Component Crash**: 
-    *   If a component crashes, `rbus_getExt` returns `RBUS_ERROR_DESTINATION_NOT_FOUND`.
-    *   The Agent intercepts this and performs a **Synchronous Batch Deregistration** of all parameters belonging to that component.
-    *   **Result**: The USP controller gets an immediate **7005 (Object Not Found)** error instead of a generic timeout.
+2.  **Batch / Component Crash**:
+    *   When `rbus_getExt` returns `DESTINATION_NOT_REACHABLE` / `DESTINATION_NOT_FOUND` / `TIMEOUT` / `BUS_ERROR`, `RDK_GetGroup` treats the provider as gone.
+    *   It calls `PurgeComponentFromCache` (or `PurgeSchemaPath` when the component name wasn't resolvable at registration time) to remove the dead paths from both the vendor cache and the USP schema.
+    *   A background task (`dml_resubscribe_task_handler`) then re-subscribes NotifyDML so that when the provider comes back, discovery events flow again.
+
+### **USP Error Codes Returned to the Caller**
+
+The vendor plugin maps RBUS-side failures to the standard USP error codes defined in TR-369, `usp_err_codes.h`:
+
+| Caller action | Condition | USP error |
+|---|---|---|
+| `get Device.X_RDK_MassStress.Param_4` (specific path) | Provider dead, schema still contains the path (transient, before purge completes) | **`7016 USP_ERR_OBJECT_DOES_NOT_EXIST`** |
+| `get Device.X_RDK_MassStress.Param_4` (specific path) | Path was already purged from the schema | **`7016 USP_ERR_OBJECT_DOES_NOT_EXIST`** (the broker translates the underlying `7026 USP_ERR_INVALID_PATH` to `7016` so callers see a consistent "object no longer exists" semantic) |
+| `get Device.X_RDK_MassStress.` (wildcard / partial path) | Provider dead | **Silent** — dead entries are omitted and the background purge runs; the next read returns the pruned set cleanly |
+
+### **Silent Purge Log Trail**
+
+When a provider disappears, the obuspa log (`/var/log/obuspa.log`) contains the reconciliation trail:
+
+```
+DML Task: Re-subscribing to NotifyDML (post-purge refresh)...
+DML Task: Re-subscribed to NotifyDML successfully
+```
+
+The wildcard GET returns nothing on stdout while this happens; specific-path GETs surface the standard `ERROR: 7016 …` line.
 
 ---
 
@@ -165,7 +184,11 @@ The system handles both single unregistrations and massive "component gone" even
     *   `VENDOR_Init`: Subscribes to `Device.` and sets thresholds (`500ms`, `maxBatchSize=100`).
     *   `dml_register_task_handler`: Safely switches from the RBUS background thread to the USP Main Loop to avoid thread-safety crashes.
     *   `PathToSchema`: Converts concrete paths (`Device.WiFi.Radio.1.`) to USP schema formats (`Device.WiFi.Radio.{i}.`).
-    *   `RDK_GetGroup`: Detects crashed providers and triggers cleanup.
+    *   `RegisterPathRecursive`: Walks concrete and schema segments in parallel; for each `{i}` segment it calls `USP_DM_InformInstance` so obuspa's instance vector is kept in sync with live table rows (pure event-driven, no polling).
+    *   `RDK_GetGroup`: Detects crashed providers, triggers cleanup, and schedules the post-purge NotifyDML resubscribe.
+    *   `PurgeComponentFromCache`: Deregisters every schema path owned by a given RBUS component and marks the cache slots as free.
+    *   `PurgeSchemaPath`: Per-path fallback used when the component name couldn't be resolved at registration time (`rbus_discoverComponentName` races during provider startup).
+    *   `IsComponentAliveOnBus` / `ReconcileProvidersFromBus`: Lazy liveness probe used by the discovery-status getters so `DiscoveredProviders` / `ProviderCount` self-heal even when no GET ever hits the dead paths.
 
 ### **C. Build System (`CMakeLists.txt`)**
 *   **Purpose**: Ensures all projects (RBUS, Vendor, OBUSPA) are linked correctly.
@@ -216,7 +239,7 @@ docker logs -f rbus-dev
 
 # Discovery-only filter
 docker exec rbus-dev tail -f /var/log/obuspa.log \
-  | grep -E "DML Task|SyncDiscovery|batch|7005"
+  | grep -E "DML Task|SyncDiscovery|batch|Re-subscrib|7016"
 ```
 
 #### Open an interactive shell (to run test commands)
@@ -311,43 +334,78 @@ onNotifyDMLBatch: Received batch of 100 DM Element discovery events
 
 ---
 
-### 7.4 Test Crash Protection — Error 7005
+### 7.4 Test Crash Protection — Silent Wildcard, Error 7016 on Specific Paths
 
-**Goal**: Verify the Agent cleans up the data model and returns USP Error 7005 when a provider crashes.
+**Goal**: Verify the Agent cleans up the data model silently for wildcard reads, and returns the standard USP `7016 OBJECT_DOES_NOT_EXIST` for specific-path reads when a provider crashes.
 
 ```bash
-# Step 1: Start a provider in the background
-rbusMassProvider 10 40 &
+# Step 1: Start a provider with 5 parameters
+rbusMassProvider 5 5 &
 PROV_PID=$!
 
-# Step 2: Verify it is visible in USP
-obuspa -s /tmp/usp_cli -c get Device.X_RDK_MassStress.40.
+# Step 2: Verify all 5 are visible
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_MassStress.
 
 # Step 3: Kill the provider (simulate a crash)
 kill -9 $PROV_PID
 
-# Step 4: Immediately try to GET the same path again
-obuspa -s /tmp/usp_cli -c get Device.X_RDK_MassStress.40.
+# Step 4a: Wildcard GET — expected to return nothing while the background purge runs
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_MassStress.
+
+# Step 4b: Specific-path GET — expected to return the standard USP error
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_MassStress.Param_2
 ```
 
-**Expected result:**
+**Expected results:**
+
+*Step 4a (wildcard):* empty output — the dead entries are silently omitted.
+
+*Step 4b (specific):*
 ```
-Error: 7005 Object Does Not Exist
+ERROR: 7016 retrieving Device.X_RDK_MassStress.Param_2 (Object does not exist)
 ```
 
-**Expected logs:**
+**Expected logs in `/var/log/obuspa.log`:**
 ```
-RDK_GetGroup: RBUS_ERROR_DESTINATION_NOT_FOUND for Device.X_RDK_MassStress.40.
-DML Task: Deregistering schema path: Device.X_RDK_MassStress.40
+DML Task: Re-subscribing to NotifyDML (post-purge refresh)...
+DML Task: Re-subscribed to NotifyDML successfully
 ```
 
 ---
 
-### 7.5 Quick Reference: Useful Log Filters
+### 7.5 Test Discovery Status Self-Healing
+
+**Goal**: Verify that `DiscoveredProviders` / `ProviderCount` report live state even when a dead provider's paths are never read back.
+
+```bash
+# Spawn three providers
+rbusTestProvider Device.X_RDK_Test.A Va &
+rbusTestProvider Device.X_RDK_Test.B Vb &
+rbusTestProvider Device.X_RDK_Test.C Vc &
+sleep 5
+
+# Check discovery status — expect 3 entries
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.ProviderCount
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.DiscoveredProviders
+
+# Kill all three without reading any of their paths
+pkill -9 -f rbusTestProvider
+sleep 2
+
+# Re-read — expect 0 entries (list self-heals via an RBUS liveness probe)
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.ProviderCount
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.DiscoveredProviders
+```
+
+**How it works:** `RDK_GetProviderCount` and `RDK_GetProviderList` call `ReconcileProvidersFromBus`, which snapshots the unique component names from the vendor cache and calls `rbus_discoverComponentDataElements` once per unique component. Components that no longer respond are fed to `PurgeComponentFromCache`, removing their schema paths and cache slots in one pass. Pseudo-components used for boot-loaded paths (`"static"`, `"persisted"`) and provenance-less entries (`"unknown"`) are treated as alive and never purged.
+
+---
+
+### 7.6 Quick Reference: Useful Log Filters
 
 ```bash
 # Watch all discovery activity live
-tail -f /var/log/obuspa.log | grep -E "DML Task|SyncDiscovery|batch|7005"
+tail -f /var/log/obuspa.log | grep -E "DML Task|SyncDiscovery|batch|Re-subscrib|7016"
 
 # Count how many paths were registered during a session
 grep "MarkPathAsRegistered\|Marked dirty" /var/log/obuspa.log | wc -l
@@ -355,7 +413,8 @@ grep "MarkPathAsRegistered\|Marked dirty" /var/log/obuspa.log | wc -l
 # Check current discovery status via USP
 obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.Status
 obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.LastSyncTime
-obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.ProviderList
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.DiscoveredProviders
+obuspa -s /tmp/usp_cli -c get Device.X_RDK_DMDiscovery.ProviderCount
 ```
 
 
@@ -370,7 +429,6 @@ The NotifyDML discovery engine is designed for extreme flexibility. You can rest
 By default, the Agent subscribes to `Device.` to find all possible components. However, you can change the `req.pattern` in `VENDOR_Init` to focus on a specific subtree:
 
 ```c
-// vendor.c:1432
 req.pattern = "Device.Services."; // Only discover Service components
 ```
 

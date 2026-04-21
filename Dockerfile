@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     valgrind \
     psmisc \
-    lcov
+    lcov \
+    openssh-server
 
 # Environment variables from Yocto SDK for default compiler flags
 ENV CFLAGS=" -Os -pipe -g -feliminate-unused-debug-types "
@@ -25,12 +26,10 @@ ENV LDFLAGS="-Wl,-O1 -Wl,--hash-style=gnu -Wl,--as-needed"
 
 WORKDIR /work
 
-# obuspa
-# Minimum version is v10.0.9 to install header files in the proper location
-ARG OBUSPA_REF="7262a0eb579cee12dfda956d036f8ec70a343b0c"
-RUN git clone https://github.com/BroadbandForum/obuspa && \
-    cd obuspa && \
-    git checkout "$OBUSPA_REF" && \
+# obuspa — built from local source (patched group_get_vector.c for per-entry error codes)
+ARG OBUSPA_CACHE_BUST=1
+COPY obuspa /work/obuspa
+RUN cd /work/obuspa && \
     autoreconf --force --install && \
     mkdir -p build && \
     cd build && \
@@ -44,6 +43,7 @@ RUN git clone https://github.com/BroadbandForum/obuspa && \
     rm -rf /work/obuspa
 
 # rbus
+ARG RBUS_CACHE_BUST=1
 COPY rbus /work/rbus
 RUN cd /work/rbus && \
     cmake -B build \
@@ -76,6 +76,21 @@ RUN cd /work/usp-pa-vendor-rdk/src/vendor && \
 # Create symlink for UspPA as requested by user
 RUN ln -s /usr/local/bin/obuspa /usr/local/bin/UspPA
 
+# Build test providers (rbus and obuspa headers must be installed first)
+COPY usp-pa-vendor-rdk/de_dm_notify/rbusMassProvider.c /tmp/rbusMassProvider.c
+COPY usp-pa-vendor-rdk/de_dm_notify/rbusTestProvider.c /tmp/rbusTestProvider.c
+RUN gcc -Os -o /usr/local/bin/rbusMassProvider /tmp/rbusMassProvider.c \
+        -I/usr/local/include/rbus -L/usr/local/lib -lrbus && \
+    gcc -Os -o /usr/local/bin/rbusTestProvider /tmp/rbusTestProvider.c \
+        -I/usr/local/include/rbus -L/usr/local/lib -lrbus && \
+    rm /tmp/rbusMassProvider.c /tmp/rbusTestProvider.c
+
+# Copy test suite scripts into /work/
+RUN mkdir -p /work
+COPY usp-pa-vendor-rdk/de_dm_notify/unified_test_suite.sh /work/unified_test_suite.sh
+RUN chmod +x /work/unified_test_suite.sh && \
+    touch /work/provider.log /work/test_report.txt
+
 COPY usp-pa-vendor-rdk/de_dm_notify/start_services.sh /usr/local/bin/start_services.sh
 RUN chmod +x /usr/local/bin/start_services.sh
 
@@ -86,7 +101,14 @@ RUN touch /var/log/rtrouted.log /var/log/obuspa.log
 RUN mkdir -p /etc/usp-pa && chmod 777 /etc/usp-pa
 
 # Ensure libraries are found
-ENV LD_LIBRARY_PATH=/usr/local/lib
-RUN ldconfig
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
+
+# Configure SSH
+RUN mkdir /var/run/sshd && \
+    echo 'root:root' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+EXPOSE 22
 
 ENTRYPOINT [ "/usr/local/bin/start_services.sh" ]

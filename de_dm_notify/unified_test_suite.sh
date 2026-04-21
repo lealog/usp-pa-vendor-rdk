@@ -128,7 +128,7 @@ verify_path() {
 
         if [ $attempt -eq 3 ]; then
             log_step "Triggering manual discovery sync..."
-            $USP_CLI -c set Device.X_RDK_Test.Sync true > /dev/null 2>&1
+            $USP_CLI -c set Device.X_RDK_DMDiscovery.TriggerSync true > /dev/null 2>&1
         fi
 
         if [ $attempt -lt 10 ]; then
@@ -148,7 +148,7 @@ test_functional() {
     
     # 1. Basic Single Parameter
     log_step "Case 1: Single Parameter Lifecycle"
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Func.Param1 ValFunc >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Func.Param1 ValFunc >> $PROVIDER_LOG 2>&1 &
     PID=$!
     verify_path "Device.X_RDK_Test.Func.Param1" "ValFunc" "exists"
     kill $PID
@@ -156,21 +156,21 @@ test_functional() {
 
     # 2. Re-registration Stability
     log_step "Case 2: Re-registration Bug Fix Verification"
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Func.Repeat Val1 >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Func.Repeat Val1 >> $PROVIDER_LOG 2>&1 &
     PID=$!
     verify_path "Device.X_RDK_Test.Func.Repeat" "Val1" "exists"
     kill $PID
     sleep 5
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Func.Repeat Val2 >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Func.Repeat Val2 >> $PROVIDER_LOG 2>&1 &
     PID2=$!
     verify_path "Device.X_RDK_Test.Func.Repeat" "Val2" "exists"
     kill $PID2
 
     # 3. Table Instances
     log_step "Case 3: Dynamic Table Instances"
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Func.Table.1.Name T1 >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Func.Table.1.Name T1 >> $PROVIDER_LOG 2>&1 &
     PIDT1=$!
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Func.Table.2.Name T2 >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Func.Table.2.Name T2 >> $PROVIDER_LOG 2>&1 &
     PIDT2=$!
     verify_path "Device.X_RDK_Test.Func.Table.1.Name" "T1" "exists"
     verify_path "Device.X_RDK_Test.Func.Table.2.Name" "T2" "exists"
@@ -185,7 +185,7 @@ test_performance() {
     
     log_step "Measuring Discovery Latency..."
     START_TIME=$(date +%s%N)
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.Perf.Latency LatencyVal >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Perf.Latency LatencyVal >> $PROVIDER_LOG 2>&1 &
     PID=$!
     
     FOUND=false
@@ -213,7 +213,7 @@ test_stress() {
     log_step "Rapid Registration (10 parameters)..."
     PIDS=()
     for i in {1..10}; do
-        /usr/bin/rbusTestProvider Device.X_RDK_Test.Stress.P$i "Val$i" >> $PROVIDER_LOG 2>&1 &
+        /usr/local/bin/rbusTestProvider Device.X_RDK_Test.Stress.P$i "Val$i" >> $PROVIDER_LOG 2>&1 &
         PIDS+=($!)
     done
     
@@ -241,7 +241,7 @@ test_nonfunctional() {
     log_header "NON-FUNCTIONAL TESTS"
     
     log_step "Agent Stability during Provider Crash"
-    /usr/bin/rbusTestProvider Device.X_RDK_Test.NonFunc.Crash Surprise >> $PROVIDER_LOG 2>&1 &
+    /usr/local/bin/rbusTestProvider Device.X_RDK_Test.NonFunc.Crash Surprise >> $PROVIDER_LOG 2>&1 &
     PID=$!
     sleep 3
     kill -9 $PID # Simulated crash

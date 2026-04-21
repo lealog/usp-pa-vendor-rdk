@@ -18,8 +18,13 @@ truncate -s 0 /etc/usp-pa/usp_dm_params.conf 2>/dev/null || true
 # Ensure rtrouted is running
 export LD_LIBRARY_PATH=/usr/local/lib
 mkdir -p /usr/local/var/obuspa
-echo "Starting rtrouted..."
-/usr/local/bin/rtrouted > /var/log/rtrouted.log 2>&1 &
+
+# Start SSH service
+echo "Starting SSH server..."
+/usr/sbin/sshd
+
+echo "Starting rtrouted in debug mode..."
+/usr/local/bin/rtrouted -r -l 5 > /var/log/rtrouted.log 2>&1 &
 sleep 2
 
 # Start obuspa with the plugin
