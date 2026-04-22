@@ -75,33 +75,39 @@ sequenceDiagram
 
 ### 2.2 Path B: Proactive (Safety Fallback)
 
-This is a background mechanism used to reconcile the data model. Even if all signals from Path A are missed, this path ensures the data model eventually reaches a consistent state.
+This is a one-shot mechanism that fires at agent startup to resolve the boot race: if a provider registered its elements before the USP Agent was ready to listen, Path A events were missed. Path B catches those elements and registers them.
 
 #### **How it works on Boot**
-1.  **Thread Launch**: Within `VENDOR_Init` (see `vendor.c`, function `VENDOR_Init`), the Agent spawns a dedicated `DiscoveryThread`.
-2.  **Immediate Sweep**: The thread immediately executes a full data model sweep (`RDK_SyncDiscovery`). 
-3.  **Boot Race Resolution**: This is critical for catching components that started and registered their elements *before* the USP Agent was fully initialized and listening for signals.
+1.  **Subscribe first**: `VENDOR_Start` subscribes to NotifyDML (Path A), then immediately calls `RDK_SyncDiscovery`.
+2.  **One-shot sweep**: `RDK_SyncDiscovery` runs once and returns. It is not a loop and has no periodic timer.
+3.  **Boot race resolution**: Any provider that registered before the Agent started will be discovered here and registered into the USP schema.
 
-#### **Periodic Behavior**
-*   **Scanning Interval**: After the initial boot sweep, the thread enters a loop that triggers a full reconciliation every **300 seconds (5 minutes)**.
-*   **Reconciliation Logic**: It performs a wildcard query (`rbusElementInfo_get`) on `Device.`. If it finds an element on the bus that is NOT yet registered in the USP schema, it triggers the registration task.
-*   **Auto-Persistence**: During the 5-minute idle period, the thread also monitors the state of the "Discovery Cache." If new elements were found via Path A, it handles auto-saving those changes to persistent flash memory after a short "cooldown" period.
+#### **Re-discovery after a crash (not periodic polling)**
+
+Path B does not run again after boot. Re-discovery for crashed and restarted providers is handled entirely by Path A via a fresh subscription:
+
+1.  A provider crash is detected by `RDK_GetGroup` (RBUS returns `DESTINATION_NOT_REACHABLE`).
+2.  The dead paths are purged from the vendor cache and USP schema.
+3.  A background task (`dml_resubscribe_task_handler`) creates a **new** NotifyDML subscription.
+4.  RBUS's internal `dmSyncSub` mechanism (~2 s interval, inside librbus) replays `CREATION` events for all elements still live on the bus against the new subscription.
+5.  Those events flow into `onNotifyDMLBatch` and the paths are re-registered automatically.
 
 ```mermaid
 sequenceDiagram
     box "USP Agent Process"
-        participant D as DiscoveryThread (vendor.c)
+        participant D as VENDOR_Start (vendor.c)
         participant V as Vendor Discovery Logic
         participant S as USP Data Model Store
     end
     participant B as RBUS Bus
 
-    D->>B: rbusElementInfo_get("Device.", depth=10)
-    B-->>D: Returns full Element List
-    D->>V: Loop through Elements
-    V->>V: IsPathAlreadyRegistered?
+    D->>B: Subscribe to NotifyDML (Path A)
+    D->>B: RDK_SyncDiscovery — one-shot sweep
+    B-->>D: Returns elements registered before Agent started
+    D->>V: Register missing paths
     V->>S: Register Missing Paths
     S-->>V: Updated
+    note over D: No periodic loop after this point
 ```
 
 ---
@@ -302,10 +308,13 @@ grep "SyncDiscovery\|DiscoveryThread" /var/log/obuspa.log
 
 **Expected logs:**
 ```
-DiscoveryThread: started
-RDK_SyncDiscovery: found Device.X_RDK_MassStress.20.*
+RDK_SyncDiscovery: Re-discovery driven by RBUS internal sync + post-purge resubscribe.
+DML Task: Processing batch of registrations (N DM Elements)
 DML Task: Dynamically registering parent object Device.X_RDK_MassStress.20
 ```
+
+> [!NOTE]
+> Path B fires once at startup and does not loop. Elements registered while the agent was down are picked up via the `dmSyncSub` replay that RBUS triggers against the new subscription.
 
 ---
 
@@ -446,15 +455,13 @@ req.pattern = "Device.Services."; // Only discover Service components
 
 This section tracks planned optimizations and features intended for future RDK releases.
 
-### **9.1 Resource Optimization: The Hash-Check Strategy**
+### **9.1 Periodic Reconciliation (not yet implemented)**
 
-Since **Path B** (`RDK_SyncDiscovery`) performs a full wildcard query of `Device.`, it can be CPU-intensive on high-parameter/low-memory CPEs.
+Path B currently runs only once at boot. A future enhancement could introduce a periodic full-bus sweep to catch any elements that slip through both Path A and the boot sweep (e.g., due to a missed batch or a librbus edge case).
 
-*   **Objective**: Avoid unnecessary full-bus sweeps during periodic reconciliation.
-*   **Proposed Logic**:
-    1.  **Hash Discovery**: Introduce a "Local Revision ID" or "Global DM Signature" on the bus.
-    2.  **Differential Sync**: Path B will first compare this Revision ID against its last cached state. If the IDs match, the Agent skips the expensive `rbusElementInfo_get` query entirely.
-*   **Benefit**: Reduces Path B's idle CPU footprint by ~90% on resource-constrained devices.
+*   **Objective**: Add an optional background loop in `RDK_SyncDiscovery` with a configurable interval (e.g., 300 s).
+*   **Proposed optimization (Hash-Check Strategy)**: To keep the sweep cheap, introduce a "Global DM Signature" on the bus. The loop would compare the current signature against a cached value and skip the expensive `rbusElementInfo_get` query entirely when nothing has changed.
+*   **Benefit**: Closes the theoretical gap where a provider registers and crashes before the Agent ever receives the NotifyDML event, without penalizing CPU on quiet systems.
 
 ### **9.2 Dynamic Scope Negotiation**
 
@@ -492,7 +499,7 @@ This section addresses fundamental architectural questions regarding system safe
 
 Based on our design of **Boot Races, Batching, and Safety Fallbacks**, here is why this architecture is robust for real-world CPE environments:
 
-*   **The "Boot Race" Resilience (Path B)**: Even if our reactive "Signal-Listener" (Path A) is perfect, there is always a risk that a component starts before the USP Agent is ready to listen. Our **Proactive Fallback (Path B)** in `DiscoveryThread` (running every 5 mins) ensures that even if a signal is missed during a messy system boot, the data model will eventually reconcile and become complete.
+*   **The "Boot Race" Resilience (Path B)**: Even if our reactive "Signal-Listener" (Path A) is perfect, there is always a risk that a component starts before the USP Agent is ready to listen. Our **Proactive Fallback (Path B)** fires once at boot — immediately after subscribing to NotifyDML — and catches any elements that registered while the Agent was initializing. After that, ongoing re-discovery relies on Path A: when a provider recovers and re-registers, a fresh NotifyDML subscription replays the registration events automatically via RBUS's internal `dmSyncSub` mechanism.
 *   **Performance Protection**: By using batching and thread-safe task hand-offs, the system ensures that discovery "storms" never block the critical real-time operations of the USP Agent.
 
 ---
