@@ -150,9 +150,10 @@ The USP specification has no standardized mechanism for filtering which paths ar
 Register these new parameters in `VENDOR_Init()`:
 
 ```
-Device.Services.X_RDK_OBUSPA.Producer.Enable       Boolean  R/W  default: true
-Device.Services.X_RDK_OBUSPA.Producer.AllowList     String   R/W  default: "" (empty = all paths)
-Device.Services.X_RDK_OBUSPA.Producer.DenyList      String   R/W  default: "Device.Security."
+Device.Services.X_RDK_OBUSPA.Producer.Enable           Boolean  R/W  default: true
+Device.Services.X_RDK_OBUSPA.Producer.AllowList         String   R/W  default: "" (empty = all paths)
+Device.Services.X_RDK_OBUSPA.Producer.DenyList          String   R/W  default: "Device.Security."
+Device.Services.X_RDK_OBUSPA.Producer.SetTimeoutSecs    Uint     R/W  default: 30
 ```
 
 **Semantics:**
@@ -252,8 +253,8 @@ if (IsPathAlreadyRegistered(path, NULL, 0)) {
 | `usp-pa-vendor-rdk/src/vendor/vendor.c` | Call `RbusProducer_Init()` in `VENDOR_Init`, `RbusProducer_Start()` in `VENDOR_Start` |
 | `obuspa/src/core/usp_broker.c` | Add static callback pointers; call them at register/deregister |
 | `obuspa/src/core/usp_broker.h` | Expose `USP_BROKER_SetServiceCallbacks` |
-| `obuspa/src/core/data_model.c` | Add `DATA_MODEL_GetParamType(path, *type_flags)` |
-| `obuspa/src/core/data_model.h` | Declare `DATA_MODEL_GetParamType` |
+| `obuspa/src/core/data_model.c` | Add `DATA_MODEL_GetParamType`, add `DATA_MODEL_SetInstanceCallbacks` and call sites in `NotifyInstanceAdded`/`NotifyInstanceDeleted` |
+| `obuspa/src/core/data_model.h` | Declare `DATA_MODEL_GetParamType`, `DATA_MODEL_SetInstanceCallbacks`, `dm_instance_added_cb_t`, `dm_instance_removed_cb_t` |
 
 RBUS consumer cache already lives in `vendor.c:435-555` — the `IsPathAlreadyRegistered` function is reused directly.
 
@@ -313,12 +314,12 @@ Called (on USP main thread, via DoWorkSync) during `RegisterProducerPath`. Resul
 
 ---
 
-### 3. Table row enumeration — why and how
+### 3. Table row enumeration — full dynamic tracking in V1
 
 **Why it is needed:**
 When we register a table schema like `Device.LocalAgent.Controller.{i}.` in RBUS, RBUS knows the table *exists* but has no knowledge of which rows (instances) are currently live. A RBUS consumer doing `rbuscli getvalues 'Device.LocalAgent.Controller.*'` would return nothing because RBUS sees an empty table.
 
-**Boot-time population (v1 scope):**
+**Boot-time population:**
 After registering the schema, call `rbusTable_registerRow` for every currently-live instance:
 
 ```c
@@ -329,39 +330,308 @@ for (int i = 0; i < num; i++)
     rbusTable_registerRow(bus_handle, "Device.LocalAgent.Controller.", instances[i], NULL);
 ```
 
-This makes `Device.LocalAgent.Controller.1.*`, `Device.LocalAgent.Controller.2.*`, etc. immediately visible to RBUS consumers.
+**Dynamic row lifecycle (V1 — runtime instance add/remove):**
+`DATA_MODEL_NotifyInstanceAdded(char *path)` and `DATA_MODEL_NotifyInstanceDeleted(char *path)` already exist in `obuspa/src/core/data_model.c` (lines 1362 and 1448). These are called whenever an instance is created or destroyed in the DM.
 
-**Dynamic row lifecycle (known v1 limitation):**
-When a new instance is created at runtime (e.g., a new controller connects to obuspa), we would need to call `rbusTable_registerRow` dynamically. Doing this correctly requires a hook for "instance added/removed" in obuspa — not yet available as a public API. For v1, boot-time row registration is sufficient for static/slow-changing tables. Dynamic tracking is a v2 item.
+Add a pair of callbacks to `data_model.c` (same pattern as the `usp_broker.c` service hooks):
+
+```c
+// New in obuspa/src/core/data_model.h
+typedef void (*dm_instance_added_cb_t)(const char *path);
+typedef void (*dm_instance_removed_cb_t)(const char *path);
+void DATA_MODEL_SetInstanceCallbacks(dm_instance_added_cb_t on_add,
+                                     dm_instance_removed_cb_t on_del);
+```
+
+Call sites in `data_model.c`:
+- End of `DATA_MODEL_NotifyInstanceAdded` → call `g_on_instance_added(path)`
+- End of `DATA_MODEL_NotifyInstanceDeleted` → call `g_on_instance_removed(path)`
+
+Vendor plugin registers them in `VENDOR_Init()` and reacts:
+```c
+// on_add: extract table name and instance number from path, call rbusTable_registerRow
+// on_del: call rbusTable_unregisterRow
+void RbusProducer_OnInstanceAdded(const char *path);
+void RbusProducer_OnInstanceRemoved(const char *path);
+```
 
 ---
 
-### 4. SET latency — two different cases
+### 4. SET latency and timeout — we must define our own
+
+**`rbusSetOptions_t` has no timeout field** (confirmed: only `commit` and `sessionId`). RBUS defines no SET handler timeout at the API level. We must define and enforce our own.
 
 **Case A — obuspa-native paths** (e.g., `Device.LocalAgent.Controller.1.Enable`):
-Call chain: RBUS SET handler → `USP_PROCESS_DM_SetParameterValue` → `DoWorkSync` → USP main thread → `DATA_MODEL_SetParameterValue` → internal DB write.
-Latency: **~1–5 ms** (local memory/DB only). Not a concern.
+Call chain: RBUS SET handler → `USP_PROCESS_DM_SetParameterValue` → `DoWorkSync` → USP main thread → internal DB write.
+Latency: **~1–5 ms**. No timeout risk.
 
 **Case B — UDS service paths** (e.g., `Device.SomeApp.Config.Value`):
-Call chain: RBUS SET handler → `USP_PROCESS_DM_SetParameterValue` → `DoWorkSync` → USP main thread → `DATA_MODEL_SetParameterValue` → `Broker_GroupSet` → builds USP Set message → sends over UDS socket → **blocks waiting for a USP Set Response** from the service → service processes the SET and replies → unblocks.
-Latency: **100 ms – several seconds**, bounded by `RESPONSE_TIMEOUT`.
+Call chain: RBUS SET handler → `USP_PROCESS_DM_SetParameterValue` → `DoWorkSync` → USP main thread → `Broker_GroupSet` → USP Set message over UDS socket → **blocks for service round-trip** → reply → unblocks.
+Latency: **100 ms – several seconds**. If the RBUS dispatcher has any watchdog or the consumer has its own timeout, an unbounded block is dangerous.
 
-**Risk:** RBUS may have an internal timeout for how long a property SET handler can block before the bus considers the provider unresponsive. This timeout must be verified to be longer than the worst-case USP UDS round-trip. If it is not, the SET for UDS-service paths may need to be made asynchronous (returning immediately from RBUS while completing the SET in the background) — but that introduces a semantic gap where RBUS reports success before the service has confirmed it. This tradeoff is a known implementation risk to verify during testing.
+**Solution — configurable producer SET timeout:**
+
+Add to the `Device.Services.X_RDK_OBUSPA.` DM:
+```
+Device.Services.X_RDK_OBUSPA.Producer.SetTimeoutSecs   Uint  R/W  default: 30
+```
+
+In the SET handler, enforce the timeout using a `pthread_cond_timedwait` wrapper around the work-queue dispatch (instead of the unconditional `USP_PROCESS_DoWorkSync`):
+
+```c
+static rbusError_t producer_set_handler(...) {
+    // Post work to USP main thread with deadline
+    struct timespec deadline = now() + g_producer_set_timeout_secs;
+    int err = DoWorkWithDeadline(producer_set_worker, &req, &deadline);
+    if (err == ETIMEDOUT) return RBUS_ERROR_TIMEOUT;
+    return (req.usp_err == USP_ERR_OK) ? RBUS_ERROR_SUCCESS : RBUS_ERROR_BUS_ERROR;
+}
+```
+
+`DoWorkWithDeadline` is a small helper in `rbus_producer.c` that uses `USP_PROCESS_DoWork` (async) + a condvar with `pthread_cond_timedwait` for bounded blocking. This is the one place where we do need a custom condvar — specifically for the timeout-bounded SET path. The GET handler remains simple (no timeout needed for reads).
 
 ---
 
-## Verification
+## Testing & Acceptance Criteria
 
-1. **Build**: rebuild Docker image after changes; confirm no compile errors.
-2. **Native paths test**:
-   ```bash
-   docker exec rbus-dev rbuscli get Device.LocalAgent.EndpointID
-   # Expect: value returned from obuspa's internal DM
-   ```
-3. **UDS service test**: connect a test USP service via UDS, confirm its registered paths appear via:
-   ```bash
-   docker exec rbus-dev rbuscli get <service-path>
-   ```
-4. **Circular-registration guard**: ensure `Device.IP.*` (RDK-owned) does NOT appear twice as a provider.
-5. **Existing tests**: run `bash run_manual_tests.sh` — consumer discovery cycles must still pass (CYCLE 1/2/3 PASS).
-6. **Deregister test**: kill a UDS service and confirm its paths are removed from RBUS (unregistered).
+> **Scope note:** UDS-MTP service path testing is explicitly excluded from this phase. A suitable USP Service container still needs to be identified. All tests here validate the static producer (obuspa-native paths) only.
+
+### Tools available inside the container
+
+| Tool | Purpose |
+|------|---------|
+| `rbuscli get <path>` | RBUS consumer single-path GET |
+| `rbuscli getvalues '<path>*'` | RBUS consumer wildcard GET |
+| `rbuscli set <path> <type> <value>` | RBUS consumer SET |
+| `rbuscli discoverRegisteredComponents` | Verify component registration |
+| `obuspa -s /tmp/usp_cli -c get <path>` | USP GET (ground truth) |
+| `obuspa -s /tmp/usp_cli -c set <path> <value>` | USP SET (ground truth) |
+| `bash run_manual_tests.sh` | Consumer discovery regression suite |
+| `docker exec rbus-dev bash /work/unified_test_suite.sh all` | Full consumer test suite |
+
+---
+
+### TC-BUILD-01: Compile without errors
+**Steps:** Build Docker image after all changes.  
+**Pass:** Image builds with zero errors and zero new warnings. `obuspa` and `UspPA` binaries present at `/usr/local/bin/`.
+
+---
+
+### TC-REG-01: Consumer discovery regression
+**Steps:** Run `bash run_manual_tests.sh`.  
+**Pass:** `CYCLE 1 PASS`, `CYCLE 2 PASS`, `CYCLE 3 PASS`. Exit code 0. The producer additions must not break the existing consumer path.
+
+---
+
+### TC-REG-02: Full unified test suite regression
+**Steps:** `docker exec rbus-dev bash /work/unified_test_suite.sh all`  
+**Pass:** All 22 test cases pass. No new failures introduced.
+
+---
+
+### TC-GET-01: GET obuspa string parameter
+**Steps:**
+```bash
+USP_VAL=$(docker exec rbus-dev obuspa -s /tmp/usp_cli -c get Device.LocalAgent.EndpointID)
+RBUS_VAL=$(docker exec rbus-dev rbuscli get Device.LocalAgent.EndpointID)
+```
+**Pass:** `RBUS_VAL` matches `USP_VAL`. RBUS value is non-empty.
+
+---
+
+### TC-GET-02: GET parameter type fidelity — Boolean
+**Steps:** GET `Device.LocalAgent.Enable` (boolean) via a custom test consumer that inspects `rbusValue_GetType()`.  
+**Pass:** `rbusValue_GetType(val) == RBUS_BOOLEAN`. Must NOT be `RBUS_STRING`.
+
+---
+
+### TC-GET-03: GET parameter type fidelity — Unsigned integer
+**Steps:** GET `Device.LocalAgent.ControllerNumberOfEntries` (uint) via test consumer.  
+**Pass:** `rbusValue_GetType(val) == RBUS_UINT32`. Value matches USP ground truth.
+
+---
+
+### TC-GET-04: GET parameter type fidelity — DateTime
+**Steps:** GET `Device.LocalAgent.UpTime` or similar datetime param via test consumer.  
+**Pass:** `rbusValue_GetType(val) == RBUS_DATETIME`. Value matches USP ground truth.
+
+---
+
+### TC-GET-05: GET non-existent path
+**Steps:** `rbuscli get Device.LocalAgent.DoesNotExist`  
+**Pass:** Returns `RBUS_ERROR_ELEMENT_DOES_NOT_EXIST`. No crash.
+
+---
+
+### TC-GET-06: GET read-only path — value unchanged after failed SET
+**Steps:**
+```bash
+rbuscli set Device.LocalAgent.EndpointID string "tampered"
+rbuscli get Device.LocalAgent.EndpointID
+```
+**Pass:** SET returns an error. GET returns the original (unchanged) value.
+
+---
+
+### TC-SET-01: SET writable obuspa parameter
+**Steps:**
+```bash
+rbuscli set Device.LocalAgent.Controller.1.Enable boolean false
+obuspa -s /tmp/usp_cli -c get Device.LocalAgent.Controller.1.Enable
+```
+**Pass:** USP GET returns `false`. SET via RBUS propagated correctly to obuspa's DM.
+
+---
+
+### TC-SET-02: SET read-only parameter rejected
+**Steps:** `rbuscli set Device.LocalAgent.EndpointID string "tampered"`  
+**Pass:** Returns non-success error code. `rbuscli get` still returns original value.
+
+---
+
+### TC-TABLE-01: Boot-time table row visibility
+**Steps:** After container start, before any runtime DM changes:
+```bash
+rbuscli getvalues 'Device.LocalAgent.Controller.*'
+```
+**Pass:** At least one instance row (`Device.LocalAgent.Controller.1.*`) is visible. All parameters within the instance are readable.
+
+---
+
+### TC-TABLE-02: Dynamic row addition
+**Steps:**
+1. Record current `rbuscli getvalues 'Device.LocalAgent.Subscription.*'` (baseline count).
+2. Add a subscription via USP: `obuspa -s /tmp/usp_cli -c add Device.LocalAgent.Subscription.`
+3. `rbuscli getvalues 'Device.LocalAgent.Subscription.*'`
+
+**Pass:** New instance row appears in RBUS within 1 second of USP add. No restart required.
+
+---
+
+### TC-TABLE-03: Dynamic row removal
+**Steps:**
+1. Note current subscription instance number `N`.
+2. Delete it via USP: `obuspa -s /tmp/usp_cli -c del Device.LocalAgent.Subscription.N.`
+3. `rbuscli getvalues 'Device.LocalAgent.Subscription.*'`
+
+**Pass:** Instance `N` row is gone from RBUS. Remaining rows still visible.
+
+---
+
+### TC-FILTER-01: DenyList excludes paths at startup
+**Steps:** `rbuscli get Device.Security.Certificate.1.SerialNumber`  
+**Pass:** Returns `RBUS_ERROR_ELEMENT_DOES_NOT_EXIST`. `Device.Security.` is in the default DenyList and must NOT be registered by the producer.
+
+---
+
+### TC-FILTER-02: DenyList runtime update
+**Steps:**
+1. Verify `Device.LocalAgent.EndpointID` is visible via RBUS.
+2. `obuspa -s /tmp/usp_cli -c set Device.Services.X_RDK_OBUSPA.Producer.DenyList "Device.Security.,Device.LocalAgent."`
+3. `rbuscli get Device.LocalAgent.EndpointID`
+
+**Pass:** Path is no longer accessible via RBUS after DenyList update. (Requires producer to re-evaluate registrations on DenyList change.)
+
+---
+
+### TC-FILTER-03: Enable=false disables all producer paths
+**Steps:**
+1. `obuspa -s /tmp/usp_cli -c set Device.Services.X_RDK_OBUSPA.Producer.Enable false`
+2. `rbuscli get Device.LocalAgent.EndpointID`
+
+**Pass:** Returns error — no producer paths accessible. Existing consumer-discovered paths (e.g., `Device.IP.*`) unaffected.
+
+---
+
+### TC-FILTER-04: Enable=true re-enables producer
+**Steps:** After TC-FILTER-03, set `Enable=true`.  
+**Pass:** `Device.LocalAgent.EndpointID` accessible again via RBUS.
+
+---
+
+### TC-FILTER-05: AllowList restricts to subset
+**Steps:**
+1. `obuspa -s /tmp/usp_cli -c set Device.Services.X_RDK_OBUSPA.Producer.AllowList "Device.LocalAgent."`
+2. `rbuscli get Device.MQTT.Client.1.Enable` (outside AllowList)
+3. `rbuscli get Device.LocalAgent.EndpointID` (inside AllowList)
+
+**Pass:** Step 2 returns error; Step 3 returns value.
+
+---
+
+### TC-CIRCULAR-01: RBUS-owned paths not double-registered
+**Steps:**
+1. Start `rbusTestProvider` registering `Device.Foo.Bar`.
+2. Wait for consumer discovery (existing path shows in `Device.X_RDK_DMDiscovery.*`).
+3. `rbuscli discoverRegisteredComponents` — check that `Device.Foo.Bar` is owned by `rbusTestProvider`, NOT by the obuspa producer component.
+
+**Pass:** No `RBUS_ERROR_ELEMENT_NAME_DUPLICATE` in logs. `Device.Foo.Bar` provider is `rbusTestProvider`.
+
+---
+
+### TC-TIMEOUT-01: SetTimeoutSecs is configurable and readable
+**Steps:**
+```bash
+obuspa -s /tmp/usp_cli -c get Device.Services.X_RDK_OBUSPA.Producer.SetTimeoutSecs
+obuspa -s /tmp/usp_cli -c set Device.Services.X_RDK_OBUSPA.Producer.SetTimeoutSecs 10
+rbuscli get Device.Services.X_RDK_OBUSPA.Producer.SetTimeoutSecs
+```
+**Pass:** Value readable via both USP and RBUS. SET via USP propagates. Value changes to `10`.
+
+---
+
+### TC-TIMEOUT-02: SET timeout enforced (simulated slow handler)
+**Steps:**
+1. Set `SetTimeoutSecs` to `2`.
+2. Inject an artificial delay in the USP main thread (test hook or debug build) to simulate a slow SET.
+3. Issue `rbuscli set <path> <val>`.
+
+**Pass:** Returns `RBUS_ERROR_TIMEOUT` after ~2 seconds. No deadlock, no hung thread.
+
+---
+
+### TC-CONCURRENCY-01: Concurrent GET calls
+**Steps:** Fire 20 parallel `rbuscli get Device.LocalAgent.EndpointID` from background shells simultaneously.  
+**Pass:** All 20 return the same correct value. No crash, no hang, no garbled output.
+
+---
+
+### TC-SELFVIS-01: Producer filter DM visible via RBUS
+**Steps:**
+```bash
+rbuscli getvalues 'Device.Services.X_RDK_OBUSPA.Producer.*'
+```
+**Pass:** `Enable`, `AllowList`, `DenyList`, `SetTimeoutSecs` all returned with correct default values.
+
+---
+
+### TC-RESTART-01: Producer re-registers after obuspa restart
+**Steps:**
+1. Verify `Device.LocalAgent.EndpointID` visible via RBUS.
+2. Restart obuspa inside container.
+3. Wait for obuspa ready (log: `USP Agent running`).
+4. `rbuscli get Device.LocalAgent.EndpointID`
+
+**Pass:** Path accessible again after restart. No manual intervention required.
+
+---
+
+### Acceptance gate
+
+All of the following must pass before the feature is considered complete for this phase:
+
+| Mandatory | TCs |
+|-----------|-----|
+| Build | TC-BUILD-01 |
+| Regression — no breakage | TC-REG-01, TC-REG-02 |
+| GET correctness | TC-GET-01 through TC-GET-06 |
+| SET correctness | TC-SET-01, TC-SET-02 |
+| Table lifecycle | TC-TABLE-01, TC-TABLE-02, TC-TABLE-03 |
+| Filter DM | TC-FILTER-01 through TC-FILTER-05 |
+| Circular guard | TC-CIRCULAR-01 |
+| Timeout | TC-TIMEOUT-01, TC-TIMEOUT-02 |
+| Concurrency | TC-CONCURRENCY-01 |
+| Self-visibility | TC-SELFVIS-01 |
+| Restart recovery | TC-RESTART-01 |
+
+> UDS-MTP producer tests (dynamic service registration/deregistration paths via RBUS) are deferred until the appropriate USP Service container is identified.
