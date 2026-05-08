@@ -1,15 +1,17 @@
-# autoconf artifacts
+# macOS
+.DS_Store
+
+# autoconf / automake artifacts
 Makefile
 Makefile.in
 */aclocal.m4
-autom4te.cache/*
+autom4te.cache/
 compile
 config.guess
 config.sub
 config.log
 config.status
 libtool
-obuspa
 configure
 depcomp
 include/config.h.in~
@@ -18,8 +20,28 @@ ltmain.sh
 m4/
 missing
 ylwrap
-*.Po
-*.o
-*.m4
 .dirstamp
+
+# libtool build artifacts
+*.la
+*.lai
+*.lo
+*.so
+*.so.*
+.libs/
+.deps/
+
+# compiler artifacts
+*.o
+*.Po
+*.m4
+
+# code coverage
+*.gcda
+*.gcno
+*.gcov
+
+# editor
 *.swp
+*.swo
+*~
